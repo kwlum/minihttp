@@ -111,12 +111,12 @@ const Server = struct {
     }
 
     fn acceptCallback(self: *Server, completion: *IO.Completion, result: IO.AcceptError!os.socket_t) void {
-        const client_socket = result catch |err| {
-            std.log.err("Server.acceptCallback - result:: {}", .{err});
+        const client_socket = result catch {
+            // std.log.err("Server.acceptCallback - result:: {}", .{err});
             return;
         };
-        var client = Client.init(self.allocator, self.io_ring, client_socket) catch |err| {
-            std.log.err("Server.acceptCallback - Client.init:: {}", .{err});
+        var client = Client.init(self.allocator, self.io_ring, client_socket) catch {
+            // std.log.err("Server.acceptCallback - Client.init:: {}", .{err});
             return;
         };
         client.run();
