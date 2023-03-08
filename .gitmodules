@@ -1,0 +1,3 @@
+[submodule "libs/httpparser"]
+	path = libs/httpparser
+	url = https://github.com/kwlum/httpparser.git
