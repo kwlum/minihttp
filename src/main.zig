@@ -13,10 +13,13 @@ pub const Header = struct {
     value: []const u8,
 };
 
-const BoundedHeaders = std.BoundedArray(httpparser.Header, 64);
-
 const Headers = struct {
-    inner: BoundedHeaders,
+    inner: [64]httpparser.Header,
+    pos: usize,
+
+    const Error = error{
+        TooManyHeaders,
+    };
 
     const Iterator = struct {
         slice: []const httpparser.Header,
@@ -37,30 +40,26 @@ const Headers = struct {
         }
     };
 
-    fn init() !Headers {
+    fn init() Headers {
         return .{
-            .inner = try BoundedHeaders.init(0),
-        };
-    }
-
-    fn fromSlice(headers: []const httpparser.Header) !Headers {
-        return .{
-            .inner = try BoundedHeaders.fromSlice(headers),
+            .inner = undefined,
+            .pos = 0,
         };
     }
 
     fn iterator(self: *const Headers) Iterator {
         return .{
-            .slice = self.inner.constSlice(),
+            .slice = self.inner[0..self.pos],
             .index = 0,
         };
     }
 
-    fn put(self: *Headers, name: []const u8, value: []const u8) !void {
-        try self.inner.append(.{
-            .name = name,
-            .value = value,
-        });
+    fn put(self: *Headers, name: []const u8, value: []const u8) Error!void {
+        if (self.pos >= self.inner.len) return Error.TooManyHeaders;
+
+        self.inner[self.pos].name = name;
+        self.inner[self.pos].value = value;
+        self.pos += 1;
     }
 };
 
@@ -79,14 +78,13 @@ pub const Response = struct {
 
 const HttpCodec = struct {
     fn decode(buffer: []const u8) !Request {
-        var http_headers: [64]httpparser.Header = undefined;
-        var http_request = httpparser.Request.init(&http_headers);
+        var request: Request = undefined;
+        request.headers = Headers.init();
+        var http_request = httpparser.Request.init(&request.headers.inner);
         try http_request.parse(buffer);
 
-        var request: Request = undefined;
-        request.headers = try Headers.fromSlice(http_headers[0..http_request.headers.len]);
         request.path = http_request.path orelse "/";
-        request.body = http_request.payload orelse "/";
+        request.body = http_request.payload orelse "";
         request.method = .GET; // default
 
         if (http_request.method) |a| {
@@ -144,8 +142,6 @@ const HttpCodec = struct {
     }
 };
 
-// TODO(KW): Create Buffer Pool.
-
 fn Client(comptime T: type) type {
     return struct {
         io_ring: *IO,
@@ -155,6 +151,7 @@ fn Client(comptime T: type) type {
         in_buffer: []u8,
         out_buffer: []u8,
         body_buffer: []u8,
+        all_buffer: []u8,
         service: T,
 
         const Self = @This();
@@ -168,9 +165,10 @@ fn Client(comptime T: type) type {
             var client = try allocator.create(Client(T));
             errdefer allocator.destroy(client);
 
-            var in_buffer = try allocator.alloc(u8, 512);
-            var out_buffer = try allocator.alloc(u8, 512);
-            var body_buffer = try allocator.alloc(u8, 512);
+            var buffer = try allocator.alloc(u8, 4096 * 3);
+            var in_buffer = buffer[0..4096];
+            var body_buffer = buffer[4096..8192];
+            var out_buffer = buffer[8192..];
             client.* = .{
                 .socket = socket,
                 .allocator = allocator,
@@ -178,6 +176,7 @@ fn Client(comptime T: type) type {
                 .in_buffer = in_buffer,
                 .out_buffer = out_buffer,
                 .body_buffer = body_buffer,
+                .all_buffer = buffer,
                 .completion = undefined,
                 .service = service,
             };
@@ -186,9 +185,7 @@ fn Client(comptime T: type) type {
         }
 
         fn deinit(self: *Self) void {
-            self.allocator.free(self.in_buffer);
-            self.allocator.free(self.out_buffer);
-            self.allocator.free(self.body_buffer);
+            self.allocator.free(self.all_buffer);
             self.allocator.destroy(self);
         }
 
@@ -228,10 +225,7 @@ fn Client(comptime T: type) type {
 
             // make response.
             var body_fbs = io.fixedBufferStream(self.body_buffer);
-            var headers = Headers.init() catch |err| {
-                std.log.err("Client.onReceive - alloc headers :: {}", .{err});
-                return;
-            };
+            var headers = Headers.init();
             var response: Response = .{
                 .status = http.Status.ok,
                 .headers = headers,
@@ -333,12 +327,7 @@ pub fn run(
 
 // User App.
 const HelloWorldService = struct {
-    name: []const u8 = "qweq",
-
-    fn handle(self: *HelloWorldService, request: Request, response: *Response) !void {
-        std.log.debug("path {s}: '{s}'", .{ self.name, request.path });
-        // response.headers.put("x-server", "zig-minihttp");
-        // response.body.writeAll("Hello World!");
+    fn handle(_: *HelloWorldService, _: Request, response: *Response) !void {
         try response.headers.put("x-server", "zig-minihttp");
         try response.body.writeAll("Hello, World!");
         response.status = http.Status.ok;
