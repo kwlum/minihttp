@@ -124,8 +124,7 @@ const HttpCodec = struct {
         out_buffer: []u8,
     ) ![]const u8 {
         var fbs = io.fixedBufferStream(out_buffer);
-        var cw = io.countingWriter(fbs.writer());
-        var writer = cw.writer();
+        var writer = fbs.writer();
         try writer.print("HTTP/1.1 {d} {s}\r\n", .{
             @enumToInt(response.status),
             response.status.phrase() orelse "",
@@ -141,9 +140,11 @@ const HttpCodec = struct {
         try writer.writeAll("\r\n");
         try writer.writeAll(body);
 
-        return out_buffer[0..cw.bytes_written];
+        return fbs.getWritten();
     }
 };
+
+// TODO(KW): Create Buffer Pool.
 
 fn Client(comptime T: type) type {
     return struct {
@@ -153,6 +154,7 @@ fn Client(comptime T: type) type {
         completion: IO.Completion,
         in_buffer: []u8,
         out_buffer: []u8,
+        body_buffer: []u8,
         service: T,
 
         const Self = @This();
@@ -168,12 +170,14 @@ fn Client(comptime T: type) type {
 
             var in_buffer = try allocator.alloc(u8, 512);
             var out_buffer = try allocator.alloc(u8, 512);
+            var body_buffer = try allocator.alloc(u8, 512);
             client.* = .{
                 .socket = socket,
                 .allocator = allocator,
                 .io_ring = io_ring,
                 .in_buffer = in_buffer,
                 .out_buffer = out_buffer,
+                .body_buffer = body_buffer,
                 .completion = undefined,
                 .service = service,
             };
@@ -184,6 +188,7 @@ fn Client(comptime T: type) type {
         fn deinit(self: *Self) void {
             self.allocator.free(self.in_buffer);
             self.allocator.free(self.out_buffer);
+            self.allocator.free(self.body_buffer);
             self.allocator.destroy(self);
         }
 
@@ -222,8 +227,7 @@ fn Client(comptime T: type) type {
             };
 
             // make response.
-            var body_buf: [1024]u8 = undefined;
-            var body_fbs = io.fixedBufferStream(&body_buf);
+            var body_fbs = io.fixedBufferStream(self.body_buffer);
             var headers = Headers.init() catch |err| {
                 std.log.err("Client.onReceive - alloc headers :: {}", .{err});
                 return;
