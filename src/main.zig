@@ -47,14 +47,14 @@ const Headers = struct {
         };
     }
 
-    fn iterator(self: *const Headers) Iterator {
+    pub fn iterator(self: *const Headers) Iterator {
         return .{
             .slice = self.inner[0..self.pos],
             .index = 0,
         };
     }
 
-    fn put(self: *Headers, name: []const u8, value: []const u8) Error!void {
+    pub fn put(self: *Headers, name: []const u8, value: []const u8) Error!void {
         if (self.pos >= self.inner.len) return Error.TooManyHeaders;
 
         self.inner[self.pos].name = name;
@@ -212,7 +212,6 @@ fn Client(comptime T: type) type {
             };
 
             if (count == 0) {
-                std.log.debug("Client close connection - {d}.", .{self.socket});
                 self.io_ring.close(*Self, self, onClose, completion, self.socket);
                 return;
             }
@@ -243,6 +242,7 @@ fn Client(comptime T: type) type {
                 return;
             };
 
+            // TODO(KW): Possible combine body and header output together in 1 buffer.
             self.io_ring.send(*Self, self, onSend, completion, self.socket, self.out_buffer[0..output.len]);
         }
 
@@ -323,22 +323,4 @@ pub fn run(
     var server = try Server(T).init(allocator, &io_ring, socket, service);
     std.log.info("Server started at port {d}", .{address.getPort()});
     try server.run();
-}
-
-// User App.
-const HelloWorldService = struct {
-    fn handle(_: *HelloWorldService, _: Request, response: *Response) !void {
-        try response.headers.put("x-server", "zig-minihttp");
-        try response.body.writeAll("Hello, World!");
-        response.status = http.Status.ok;
-    }
-};
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-
-    const address = try std.net.Address.parseIp4("127.0.0.1", 8000);
-    var service = HelloWorldService{};
-    try run(*HelloWorldService, gpa.allocator(), address, &service);
 }
