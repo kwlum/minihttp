@@ -1,8 +1,8 @@
 const std = @import("std");
 const ascii = std.ascii;
 const http = std.http;
+const io = std.io;
 const mem = std.mem;
-const net = std.net;
 const os = std.os;
 
 const httpparser = @import("httpparser");
@@ -74,7 +74,7 @@ pub const Request = struct {
 pub const Response = struct {
     status: http.Status,
     headers: Headers,
-    body: std.fifo.LinearFifo(u8, std.fifo.LinearFifoBufferType.Slice).Writer,
+    body: io.FixedBufferStream([]u8).Writer,
 };
 
 const HttpCodec = struct {
@@ -91,7 +91,7 @@ const HttpCodec = struct {
 
         if (http_request.method) |a| {
             var lower_buf: [16]u8 = undefined;
-            const method_string = std.ascii.lowerString(&lower_buf, a);
+            const method_string = ascii.lowerString(&lower_buf, a);
 
             request.method = if (mem.eql(u8, method_string, "get"))
                 .GET
@@ -123,8 +123,8 @@ const HttpCodec = struct {
         body: []const u8,
         out_buffer: []u8,
     ) ![]const u8 {
-        var fba = std.io.fixedBufferStream(out_buffer);
-        var cw = std.io.countingWriter(fba.writer());
+        var fbs = io.fixedBufferStream(out_buffer);
+        var cw = io.countingWriter(fbs.writer());
         var writer = cw.writer();
         try writer.print("HTTP/1.1 {d} {s}\r\n", .{
             @enumToInt(response.status),
@@ -159,7 +159,7 @@ fn Client(comptime T: type) type {
 
         fn init(
             allocator: mem.Allocator,
-            io: *IO,
+            io_ring: *IO,
             socket: os.socket_t,
             service: T,
         ) !*Client(T) {
@@ -171,7 +171,7 @@ fn Client(comptime T: type) type {
             client.* = .{
                 .socket = socket,
                 .allocator = allocator,
-                .io_ring = io,
+                .io_ring = io_ring,
                 .in_buffer = in_buffer,
                 .out_buffer = out_buffer,
                 .completion = undefined,
@@ -223,7 +223,7 @@ fn Client(comptime T: type) type {
 
             // make response.
             var body_buf: [1024]u8 = undefined;
-            var body_fifo = std.fifo.LinearFifo(u8, std.fifo.LinearFifoBufferType.Slice).init(&body_buf);
+            var body_fbs = io.fixedBufferStream(&body_buf);
             var headers = Headers.init() catch |err| {
                 std.log.err("Client.onReceive - alloc headers :: {}", .{err});
                 return;
@@ -231,7 +231,7 @@ fn Client(comptime T: type) type {
             var response: Response = .{
                 .status = http.Status.ok,
                 .headers = headers,
-                .body = body_fifo.writer(),
+                .body = body_fbs.writer(),
             };
 
             // call the service.
@@ -240,8 +240,7 @@ fn Client(comptime T: type) type {
                 return;
             };
 
-            const body_count = body_fifo.readableLength();
-            const output = HttpCodec.encode(response, body_buf[0..body_count], self.out_buffer) catch |err| {
+            const output = HttpCodec.encode(response, body_fbs.getWritten(), self.out_buffer) catch |err| {
                 std.log.err("Client.dispatchRequest - HttpCodec.encode :: {}", .{err});
                 return;
             };
@@ -277,9 +276,9 @@ fn Server(comptime T: type) type {
 
         const Self = @This();
 
-        fn init(allocator: mem.Allocator, io: *IO, socket: os.socket_t, service: T) Server(T) {
+        fn init(allocator: mem.Allocator, io_ring: *IO, socket: os.socket_t, service: T) Server(T) {
             return .{
-                .io_ring = io,
+                .io_ring = io_ring,
                 .socket = socket,
                 .allocator = allocator,
                 .service = service,
@@ -310,20 +309,20 @@ fn Server(comptime T: type) type {
 pub fn run(
     comptime T: type,
     allocator: mem.Allocator,
-    address: net.Address,
+    address: std.net.Address,
     service: T,
 ) !void {
     const socket = try os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, 0);
     defer os.close(socket);
 
-    try os.setsockopt(socket, os.SOL.SOCKET, os.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    try os.setsockopt(socket, os.SOL.SOCKET, os.SO.REUSEADDR, &mem.toBytes(@as(c_int, 1)));
     try os.bind(socket, &address.any, address.getOsSockLen());
     try os.listen(socket, 1);
 
-    var io = try IO.init(32, 0);
-    defer io.deinit();
+    var io_ring = try IO.init(32, 0);
+    defer io_ring.deinit();
 
-    var server = Server(T).init(allocator, &io, socket, service);
+    var server = Server(T).init(allocator, &io_ring, socket, service);
     std.log.info("Server started at port {d}", .{address.getPort()});
     try server.run();
 }
