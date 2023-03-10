@@ -13,10 +13,13 @@ pub const Header = struct {
     value: []const u8,
 };
 
-const BoundedHeaders = std.BoundedArray(httpparser.Header, 64);
-
 const Headers = struct {
-    inner: BoundedHeaders,
+    inner: [64]httpparser.Header,
+    pos: usize,
+
+    const Error = error{
+        TooManyHeaders,
+    };
 
     const Iterator = struct {
         slice: []const httpparser.Header,
@@ -37,30 +40,26 @@ const Headers = struct {
         }
     };
 
-    fn init() !Headers {
+    fn init() Headers {
         return .{
-            .inner = try BoundedHeaders.init(0),
-        };
-    }
-
-    fn fromSlice(headers: []const httpparser.Header) !Headers {
-        return .{
-            .inner = try BoundedHeaders.fromSlice(headers),
+            .inner = undefined,
+            .pos = 0,
         };
     }
 
     fn iterator(self: *const Headers) Iterator {
         return .{
-            .slice = self.inner.constSlice(),
+            .slice = self.inner[0..self.pos],
             .index = 0,
         };
     }
 
-    fn put(self: *Headers, name: []const u8, value: []const u8) !void {
-        try self.inner.append(.{
-            .name = name,
-            .value = value,
-        });
+    fn put(self: *Headers, name: []const u8, value: []const u8) Error!void {
+        if (self.pos >= self.inner.len) return Error.TooManyHeaders;
+
+        self.inner[self.pos].name = name;
+        self.inner[self.pos].value = value;
+        self.pos += 1;
     }
 };
 
@@ -79,14 +78,13 @@ pub const Response = struct {
 
 const HttpCodec = struct {
     fn decode(buffer: []const u8) !Request {
-        var http_headers: [64]httpparser.Header = undefined;
-        var http_request = httpparser.Request.init(&http_headers);
+        var request: Request = undefined;
+        request.headers = Headers.init();
+        var http_request = httpparser.Request.init(&request.headers.inner);
         try http_request.parse(buffer);
 
-        var request: Request = undefined;
-        request.headers = try Headers.fromSlice(http_headers[0..http_request.headers.len]);
         request.path = http_request.path orelse "/";
-        request.body = http_request.payload orelse "/";
+        request.body = http_request.payload orelse "";
         request.method = .GET; // default
 
         if (http_request.method) |a| {
@@ -144,60 +142,6 @@ const HttpCodec = struct {
     }
 };
 
-const BufferPool = struct {
-    buffers: Buffers,
-    arena: *std.heap.ArenaAllocator,
-    allocator: mem.Allocator,
-
-    const Buffers = std.fifo.LinearFifo([]u8, std.fifo.LinearFifoBufferType.Dynamic);
-
-    fn init(allocator: mem.Allocator) !BufferPool {
-        var arena = try allocator.create(std.heap.ArenaAllocator);
-        errdefer allocator.destroy(arena);
-
-        arena.* = std.heap.ArenaAllocator.init(allocator);
-        var buffers = Buffers.init(arena.allocator());
-
-        return .{
-            .arena = arena,
-            .buffers = buffers,
-            .allocator = allocator,
-        };
-    }
-
-    fn deinit(self: *BufferPool) void {
-        self.buffers.deinit();
-        self.arena.deinit();
-        self.allocator.destroy(self.arena);
-    }
-
-    fn ensureCapacity(self: *BufferPool, size: u16) !void {
-        const allocator = self.arena.allocator();
-        var i: u16 = 0;
-        while (i < size) : (i += 1) {
-            const buffer = try allocator.alloc(u8, 4096);
-            try self.buffers.writeItem(buffer);
-        }
-    }
-
-    fn take(self: *BufferPool) ![]u8 {
-        if (self.buffers.readableLength() == 0) {
-            const allocator = self.arena.allocator();
-            var buffers: [16][]u8 = undefined;
-            for (buffers) |*a| {
-                a.* = try allocator.alloc(u8, 4096);
-            }
-            try self.buffers.write(&buffers);
-        }
-
-        return self.buffers.readItem().?;
-    }
-
-    fn give(self: *BufferPool, buffer: []u8) void {
-        self.buffers.writeItem(buffer) catch @panic("Unable to return buffer back to pool.");
-    }
-};
-
 fn Client(comptime T: type) type {
     return struct {
         io_ring: *IO,
@@ -207,7 +151,7 @@ fn Client(comptime T: type) type {
         in_buffer: []u8,
         out_buffer: []u8,
         body_buffer: []u8,
-        pool: *BufferPool,
+        all_buffer: []u8,
         service: T,
 
         const Self = @This();
@@ -216,15 +160,15 @@ fn Client(comptime T: type) type {
             allocator: mem.Allocator,
             io_ring: *IO,
             socket: os.socket_t,
-            pool: *BufferPool,
             service: T,
         ) !*Client(T) {
             var client = try allocator.create(Client(T));
             errdefer allocator.destroy(client);
 
-            var in_buffer = try pool.take();
-            var out_buffer = try pool.take();
-            var body_buffer = try pool.take();
+            var buffer = try allocator.alloc(u8, 4096 * 3);
+            var in_buffer = buffer[0..4096];
+            var body_buffer = buffer[4096..8192];
+            var out_buffer = buffer[8192..];
             client.* = .{
                 .socket = socket,
                 .allocator = allocator,
@@ -232,8 +176,8 @@ fn Client(comptime T: type) type {
                 .in_buffer = in_buffer,
                 .out_buffer = out_buffer,
                 .body_buffer = body_buffer,
+                .all_buffer = buffer,
                 .completion = undefined,
-                .pool = pool,
                 .service = service,
             };
 
@@ -241,9 +185,7 @@ fn Client(comptime T: type) type {
         }
 
         fn deinit(self: *Self) void {
-            self.pool.give(self.in_buffer);
-            self.pool.give(self.out_buffer);
-            self.pool.give(self.body_buffer);
+            self.allocator.free(self.all_buffer);
             self.allocator.destroy(self);
         }
 
@@ -283,10 +225,7 @@ fn Client(comptime T: type) type {
 
             // make response.
             var body_fbs = io.fixedBufferStream(self.body_buffer);
-            var headers = Headers.init() catch |err| {
-                std.log.err("Client.onReceive - alloc headers :: {}", .{err});
-                return;
-            };
+            var headers = Headers.init();
             var response: Response = .{
                 .status = http.Status.ok,
                 .headers = headers,
@@ -332,27 +271,16 @@ fn Server(comptime T: type) type {
         io_ring: *IO,
         allocator: mem.Allocator,
         service: T,
-        pool: BufferPool,
 
         const Self = @This();
 
         fn init(allocator: mem.Allocator, io_ring: *IO, socket: os.socket_t, service: T) !Server(T) {
-            var pool = try BufferPool.init(allocator);
-            errdefer pool.deinit();
-
-            try pool.ensureCapacity(64);
-
             return .{
                 .io_ring = io_ring,
                 .socket = socket,
                 .allocator = allocator,
                 .service = service,
-                .pool = pool,
             };
-        }
-
-        fn deinit(self: *Self) void {
-            self.pool.deinit();
         }
 
         fn run(self: *Self) !void {
@@ -366,7 +294,7 @@ fn Server(comptime T: type) type {
                 std.log.err("Server.acceptCallback - result:: {}", .{err});
                 return;
             };
-            var client = Client(T).init(self.allocator, self.io_ring, client_socket, &self.pool, self.service) catch |err| {
+            var client = Client(T).init(self.allocator, self.io_ring, client_socket, self.service) catch |err| {
                 std.log.err("Server.acceptCallback - Client.init:: {}", .{err});
                 return;
             };
@@ -393,16 +321,12 @@ pub fn run(
     defer io_ring.deinit();
 
     var server = try Server(T).init(allocator, &io_ring, socket, service);
-    defer server.deinit();
-
     std.log.info("Server started at port {d}", .{address.getPort()});
     try server.run();
 }
 
 // User App.
 const HelloWorldService = struct {
-    name: []const u8 = "qweq",
-
     fn handle(_: *HelloWorldService, _: Request, response: *Response) !void {
         try response.headers.put("x-server", "zig-minihttp");
         try response.body.writeAll("Hello, World!");
