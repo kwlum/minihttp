@@ -144,7 +144,59 @@ const HttpCodec = struct {
     }
 };
 
-// TODO(KW): Create Buffer Pool.
+const BufferPool = struct {
+    buffers: Buffers,
+    arena: *std.heap.ArenaAllocator,
+    allocator: mem.Allocator,
+
+    const Buffers = std.fifo.LinearFifo([]u8, std.fifo.LinearFifoBufferType.Dynamic);
+
+    fn init(allocator: mem.Allocator) !BufferPool {
+        var arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        var buffers = Buffers.init(arena.allocator());
+
+        return .{
+            .arena = arena,
+            .buffers = buffers,
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(self: *BufferPool) void {
+        self.buffers.deinit();
+        self.arena.deinit();
+        self.allocator.destroy(self.arena);
+    }
+
+    fn ensureCapacity(self: *BufferPool, size: u16) !void {
+        const allocator = self.arena.allocator();
+        var i: u16 = 0;
+        while (i < size) : (i += 1) {
+            const buffer = try allocator.alloc(u8, 4096);
+            try self.buffers.writeItem(buffer);
+        }
+    }
+
+    fn take(self: *BufferPool) ![]u8 {
+        if (self.buffers.readableLength() == 0) {
+            const allocator = self.arena.allocator();
+            var buffers: [16][]u8 = undefined;
+            for (buffers) |*a| {
+                a.* = try allocator.alloc(u8, 4096);
+            }
+            try self.buffers.write(&buffers);
+        }
+
+        return self.buffers.readItem().?;
+    }
+
+    fn give(self: *BufferPool, buffer: []u8) void {
+        self.buffers.writeItem(buffer) catch @panic("Unable to return buffer back to pool.");
+    }
+};
 
 fn Client(comptime T: type) type {
     return struct {
@@ -155,6 +207,7 @@ fn Client(comptime T: type) type {
         in_buffer: []u8,
         out_buffer: []u8,
         body_buffer: []u8,
+        pool: *BufferPool,
         service: T,
 
         const Self = @This();
@@ -163,14 +216,15 @@ fn Client(comptime T: type) type {
             allocator: mem.Allocator,
             io_ring: *IO,
             socket: os.socket_t,
+            pool: *BufferPool,
             service: T,
         ) !*Client(T) {
             var client = try allocator.create(Client(T));
             errdefer allocator.destroy(client);
 
-            var in_buffer = try allocator.alloc(u8, 512);
-            var out_buffer = try allocator.alloc(u8, 512);
-            var body_buffer = try allocator.alloc(u8, 512);
+            var in_buffer = try pool.take();
+            var out_buffer = try pool.take();
+            var body_buffer = try pool.take();
             client.* = .{
                 .socket = socket,
                 .allocator = allocator,
@@ -179,6 +233,7 @@ fn Client(comptime T: type) type {
                 .out_buffer = out_buffer,
                 .body_buffer = body_buffer,
                 .completion = undefined,
+                .pool = pool,
                 .service = service,
             };
 
@@ -186,9 +241,9 @@ fn Client(comptime T: type) type {
         }
 
         fn deinit(self: *Self) void {
-            self.allocator.free(self.in_buffer);
-            self.allocator.free(self.out_buffer);
-            self.allocator.free(self.body_buffer);
+            self.pool.give(self.in_buffer);
+            self.pool.give(self.out_buffer);
+            self.pool.give(self.body_buffer);
             self.allocator.destroy(self);
         }
 
@@ -277,16 +332,27 @@ fn Server(comptime T: type) type {
         io_ring: *IO,
         allocator: mem.Allocator,
         service: T,
+        pool: BufferPool,
 
         const Self = @This();
 
-        fn init(allocator: mem.Allocator, io_ring: *IO, socket: os.socket_t, service: T) Server(T) {
+        fn init(allocator: mem.Allocator, io_ring: *IO, socket: os.socket_t, service: T) !Server(T) {
+            var pool = try BufferPool.init(allocator);
+            errdefer pool.deinit();
+
+            try pool.ensureCapacity(64);
+
             return .{
                 .io_ring = io_ring,
                 .socket = socket,
                 .allocator = allocator,
                 .service = service,
+                .pool = pool,
             };
+        }
+
+        fn deinit(self: *Self) void {
+            self.pool.deinit();
         }
 
         fn run(self: *Self) !void {
@@ -300,7 +366,7 @@ fn Server(comptime T: type) type {
                 std.log.err("Server.acceptCallback - result:: {}", .{err});
                 return;
             };
-            var client = Client(T).init(self.allocator, self.io_ring, client_socket, self.service) catch |err| {
+            var client = Client(T).init(self.allocator, self.io_ring, client_socket, &self.pool, self.service) catch |err| {
                 std.log.err("Server.acceptCallback - Client.init:: {}", .{err});
                 return;
             };
@@ -326,7 +392,9 @@ pub fn run(
     var io_ring = try IO.init(32, 0);
     defer io_ring.deinit();
 
-    var server = Server(T).init(allocator, &io_ring, socket, service);
+    var server = try Server(T).init(allocator, &io_ring, socket, service);
+    defer server.deinit();
+
     std.log.info("Server started at port {d}", .{address.getPort()});
     try server.run();
 }
@@ -335,10 +403,7 @@ pub fn run(
 const HelloWorldService = struct {
     name: []const u8 = "qweq",
 
-    fn handle(self: *HelloWorldService, request: Request, response: *Response) !void {
-        std.log.debug("path {s}: '{s}'", .{ self.name, request.path });
-        // response.headers.put("x-server", "zig-minihttp");
-        // response.body.writeAll("Hello World!");
+    fn handle(_: *HelloWorldService, _: Request, response: *Response) !void {
         try response.headers.put("x-server", "zig-minihttp");
         try response.body.writeAll("Hello, World!");
         response.status = http.Status.ok;
