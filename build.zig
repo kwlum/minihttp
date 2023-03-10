@@ -14,6 +14,7 @@ pub fn build(b: *std.build.Builder) void {
     const exe = b.addExecutable("minihttp", "src/main.zig");
     exe.setTarget(target);
     exe.setBuildMode(mode);
+    exe.addPackagePath("httpparser", "libs/httpparser/src/main.zig");
     exe.install();
 
     const run_cmd = exe.run();
