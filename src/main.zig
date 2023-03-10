@@ -135,8 +135,8 @@ const HttpCodec = struct {
             try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
         }
 
-        try writer.writeAll("\r\n");
-        try writer.writeAll(body);
+        _ = try fbs.write("\r\n");
+        _ = try fbs.write(body);
 
         return fbs.getWritten();
     }
