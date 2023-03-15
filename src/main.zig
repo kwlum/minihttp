@@ -232,7 +232,7 @@ fn Client(comptime T: type) type {
             };
 
             // call the service.
-            @call(.{}, self.service.handle, .{ request, &response }) catch |err| {
+            @call(.auto, self.service.handle, .{ request, &response }) catch |err| {
                 std.log.err("Client.dispatchRequest - handle fn :: {}", .{err});
                 return;
             };

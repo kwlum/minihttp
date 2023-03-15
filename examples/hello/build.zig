@@ -1,34 +1,31 @@
 const std = @import("std");
 
 pub fn build(b: *std.build.Builder) void {
-    // Standard target options allows the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
 
-    // Standard release options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
-    const mode = b.standardReleaseOptions();
+    const httpparser_dep = b.dependency("httpparser", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
-    const httpparser_pkg = std.build.Pkg{
-        .name = "httpparser",
-        .source = .{ .path = "../../libs/httpparser/src/main.zig" },
-        .dependencies = null,
-    };
+    const minihttp_mod = b.createModule(.{
+        .source_file = .{ .path = "../../src/main.zig" },
+        .dependencies = &[_]std.build.ModuleDependency{
+            .{
+                .name = "httpparser",
+                .module = httpparser_dep.module("httpparser"),
+            },
+        },
+    });
 
-    const minihttp_pkg = std.build.Pkg{
-        .name = "minihttp",
-        .source = .{ .path = "../../src/main.zig" },
-        .dependencies = &[_]std.build.Pkg{httpparser_pkg},
-    };
-
-    const exe = b.addExecutable("hello", "src/main.zig");
-    exe.setTarget(target);
-    exe.setBuildMode(mode);
-    exe.addPackage(minihttp_pkg);
-    // exe.addPackagePath("httpparser", "../../libs/httpparser/src/main.zig");
-    // exe.addPackagePath("minihttp", "../../src/main.zig");
+    const exe = b.addExecutable(.{
+        .name = "hello",
+        .root_source_file = .{ .path = "src/main.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.addModule("minihttp", minihttp_mod);
     exe.install();
 
     const run_cmd = exe.run();
@@ -40,10 +37,11 @@ pub fn build(b: *std.build.Builder) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    const exe_tests = b.addTest("src/main.zig");
-    exe_tests.setTarget(target);
-    exe_tests.setBuildMode(mode);
-
+    const exe_tests = b.addTest(.{
+        .root_source_file = .{ .path = "src/main.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&exe_tests.step);
 }
