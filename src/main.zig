@@ -6,7 +6,7 @@ const mem = std.mem;
 const os = std.os;
 
 const httpparser = @import("httpparser");
-const IO = @import("linux.zig").IO;
+const xev = @import("xev");
 
 pub const Header = struct {
     name: []const u8,
@@ -143,45 +143,47 @@ const HttpCodec = struct {
 };
 
 const BufferPool = std.heap.MemoryPool([4096]u8);
+const CompletionPool = std.heap.MemoryPool(xev.Completion);
 
 fn Client(comptime T: type) type {
     return struct {
-        io_ring: *IO,
-        socket: os.socket_t,
+        ev_loop: *xev.Loop,
         allocator: mem.Allocator,
-        completion: IO.Completion,
-        in_buffer: []u8,
-        out_buffer: []u8,
+        read_buffer: []u8,
+        write_buffer: []u8,
         body_buffer: []u8,
+        socket: xev.TCP,
         service: T,
         buffer_pool: *BufferPool,
+        completion_pool: *CompletionPool,
 
         const Self = @This();
 
         fn init(
             allocator: mem.Allocator,
             buffer_pool: *BufferPool,
-            io_ring: *IO,
-            socket: os.socket_t,
+            completion_pool: *CompletionPool,
+            ev_loop: *xev.Loop,
+            socket: xev.TCP,
             service: T,
         ) !*Client(T) {
             var client = try allocator.create(Client(T));
             errdefer allocator.destroy(client);
 
-            var in_buffer = try buffer_pool.create();
+            var read_buffer = try buffer_pool.create();
             var body_buffer = try buffer_pool.create();
-            var out_buffer = try buffer_pool.create();
+            var write_buffer = try buffer_pool.create();
 
             client.* = .{
+                .ev_loop = ev_loop,
                 .socket = socket,
                 .allocator = allocator,
-                .io_ring = io_ring,
-                .in_buffer = in_buffer,
-                .out_buffer = out_buffer,
+                .read_buffer = read_buffer,
+                .write_buffer = write_buffer,
                 .body_buffer = body_buffer,
-                .completion = undefined,
                 .service = service,
                 .buffer_pool = buffer_pool,
+                .completion_pool = completion_pool,
             };
 
             return client;
@@ -191,7 +193,7 @@ fn Client(comptime T: type) type {
             self.buffer_pool.destroy(
                 @alignCast(
                     BufferPool.item_alignment,
-                    @intToPtr(*[4096]u8, @ptrToInt(self.in_buffer.ptr)),
+                    @intToPtr(*[4096]u8, @ptrToInt(self.read_buffer.ptr)),
                 ),
             );
             self.buffer_pool.destroy(
@@ -203,7 +205,7 @@ fn Client(comptime T: type) type {
             self.buffer_pool.destroy(
                 @alignCast(
                     BufferPool.item_alignment,
-                    @intToPtr(*[4096]u8, @ptrToInt(self.out_buffer.ptr)),
+                    @intToPtr(*[4096]u8, @ptrToInt(self.write_buffer.ptr)),
                 ),
             );
             self.allocator.destroy(self);
@@ -213,33 +215,67 @@ fn Client(comptime T: type) type {
             self.receive();
         }
 
+        fn close(self: *Self) void {
+            const completion = self.completion_pool.create() catch unreachable;
+            self.socket.close(self.ev_loop, completion, Self, self, onClose);
+        }
+
         fn receive(self: *Self) void {
-            self.io_ring.recv(
-                *Self,
+            const completion = self.completion_pool.create() catch unreachable;
+            self.socket.read(
+                self.ev_loop,
+                completion,
+                .{ .slice = self.read_buffer },
+                Self,
                 self,
                 onReceive,
-                &self.completion,
-                self.socket,
-                self.in_buffer,
             );
         }
 
-        fn onReceive(self: *Self, completion: *IO.Completion, result: IO.RecvError!usize) void {
+        fn send(self: *Self, write_count: usize) void {
+            const completion = self.completion_pool.create() catch unreachable;
+            self.socket.write(
+                self.ev_loop,
+                completion,
+                .{ .slice = self.write_buffer[0..write_count] },
+                Self,
+                self,
+                onSend,
+            );
+        }
+
+        fn onReceive(
+            self_: ?*Self,
+            _: *xev.Loop,
+            completion: *xev.Completion,
+            _: xev.TCP,
+            buffer: xev.ReadBuffer,
+            result: xev.ReadError!usize,
+        ) xev.CallbackAction {
+            const self = self_.?;
+
+            defer {
+                std.log.debug("onReceive - completion :: {}", .{completion.state()});
+                if (completion.state() == .dead) {
+                    self.completion_pool.destroy(completion);
+                }
+            }
+
             const count = result catch {
-                // std.log.err("Client.onReceive - {d}, result :: {}", .{ self.socket, err });
-                self.io_ring.close(*Self, self, onClose, completion, self.socket);
-                return;
+                // std.log.err("Client.onReceive, result :: {}", .{err});
+                self.close();
+                return .disarm;
             };
 
             if (count == 0) {
-                self.io_ring.close(*Self, self, onClose, completion, self.socket);
-                return;
+                self.close();
+                return .disarm;
             }
 
             // decode buffer.
-            const request = HttpCodec.decode(self.in_buffer[0..count]) catch |err| {
+            const request = HttpCodec.decode(buffer.slice[0..count]) catch |err| {
                 std.log.err("Client.onReceive - decode :: {}", .{err});
-                return;
+                return .disarm;
             };
 
             // make response.
@@ -254,55 +290,94 @@ fn Client(comptime T: type) type {
             // call the service.
             @call(.auto, self.service.handle, .{ request, &response }) catch |err| {
                 std.log.err("Client.dispatchRequest - handle fn :: {}", .{err});
-                return;
+                return .disarm;
             };
 
-            const output = HttpCodec.encode(response, body_fbs.getWritten(), self.out_buffer) catch |err| {
+            const output = HttpCodec.encode(response, body_fbs.getWritten(), self.write_buffer) catch |err| {
                 std.log.err("Client.dispatchRequest - HttpCodec.encode :: {}", .{err});
-                return;
+                return .disarm;
             };
 
-            // TODO(KW): Possible combine body and header output together in 1 buffer.
-            self.io_ring.send(*Self, self, onSend, completion, self.socket, self.out_buffer[0..output.len]);
+            self.send(output.len);
+            return .disarm;
         }
 
-        fn onSend(self: *Self, _: *IO.Completion, result: IO.SendError!usize) void {
+        fn onSend(
+            self_: ?*Self,
+            _: *xev.Loop,
+            completion: *xev.Completion,
+            _: xev.TCP,
+            _: xev.WriteBuffer,
+            result: xev.WriteError!usize,
+        ) xev.CallbackAction {
+            const self = self_.?;
+            defer {
+                std.log.debug("onSend - completion :: {}", .{completion.state()});
+                if (completion.state() == .dead) {
+                    self.completion_pool.destroy(completion);
+                }
+            }
+
             _ = result catch |err| {
                 std.log.err("Client.onSend - result :: {}", .{err});
-                return;
+                return .disarm;
             };
 
             self.receive();
+            return .disarm;
         }
 
-        fn onClose(self: *Self, _: *IO.Completion, result: IO.CloseError!void) void {
+        fn onClose(
+            self_: ?*Self,
+            _: *xev.Loop,
+            completion: *xev.Completion,
+            _: xev.TCP,
+            result: xev.CloseError!void,
+        ) xev.CallbackAction {
+            const self = self_.?;
+            const completion_pool = self.completion_pool;
+
+            defer {
+                std.log.debug("onClose - completion :: {}", .{completion.state()});
+                if (completion.state() == .dead) {
+                    completion_pool.destroy(completion);
+                }
+            }
+
             _ = result catch |err| {
-                std.log.err("Client.onClose - {d}, result :: {}", .{ self.socket, err });
-                return;
+                std.log.err("Client.onClose, result :: {}", .{err});
+                return .disarm;
             };
+
             self.deinit();
+            return .disarm;
         }
     };
 }
 
 fn Server(comptime T: type) type {
     return struct {
-        socket: os.socket_t,
-        io_ring: *IO,
         allocator: mem.Allocator,
-        service: T,
+        ev_loop: xev.Loop,
+        socket: xev.TCP,
         buffer_pool: BufferPool,
+        completion_pool: CompletionPool,
+        service: T,
 
         const Self = @This();
 
-        fn init(allocator: mem.Allocator, io_ring: *IO, socket: os.socket_t, service: T) !Server(T) {
-            const pool = try BufferPool.initPreheated(allocator, 32);
+        fn init(allocator: mem.Allocator, socket: xev.TCP, service: T) !Server(T) {
+            var ev_loop = try xev.Loop.init(.{});
+            const buffer_pool = try BufferPool.initPreheated(allocator, 32);
+            const completion_pool = CompletionPool.init(allocator);
+
             return .{
-                .io_ring = io_ring,
+                .ev_loop = ev_loop,
                 .socket = socket,
                 .allocator = allocator,
                 .service = service,
-                .buffer_pool = pool,
+                .buffer_pool = buffer_pool,
+                .completion_pool = completion_pool,
             };
         }
 
@@ -310,23 +385,44 @@ fn Server(comptime T: type) type {
             self.buffer_pool.deinit();
         }
 
-        fn run(self: *Self) !void {
-            var completion: IO.Completion = undefined;
-            self.io_ring.accept(*Self, self, onAccept, &completion, self.socket);
-            while (true) try self.io_ring.tick();
+        fn accept(self: *Self) void {
+            const completion = self.completion_pool.create() catch unreachable;
+            self.socket.accept(&self.ev_loop, completion, Self, self, onAccept);
         }
 
-        fn onAccept(self: *Self, completion: *IO.Completion, result: IO.AcceptError!os.socket_t) void {
+        fn run(self: *Self) !void {
+            self.accept();
+            try self.ev_loop.run(.until_done);
+        }
+
+        fn onAccept(
+            self_: ?*Self,
+            _: *xev.Loop,
+            completion: *xev.Completion,
+            result: xev.AcceptError!xev.TCP,
+        ) xev.CallbackAction {
+            const self = self_.?;
+
+            defer {
+                if (completion.state() == .dead) {
+                    self.completion_pool.destroy(completion);
+                }
+            }
+
             const client_socket = result catch |err| {
                 std.log.err("Server.acceptCallback - result:: {}", .{err});
-                return;
+                return .disarm;
             };
-            var client = Client(T).init(self.allocator, &self.buffer_pool, self.io_ring, client_socket, self.service) catch |err| {
+
+            var client = Client(T).init(self.allocator, &self.buffer_pool, &self.completion_pool, &self.ev_loop, client_socket, self.service) catch |err| {
                 std.log.err("Server.acceptCallback - Client.init:: {}", .{err});
-                return;
+                return .disarm;
             };
+
             client.run();
-            self.io_ring.accept(*Self, self, onAccept, completion, self.socket);
+            self.accept();
+
+            return .disarm;
         }
     };
 }
@@ -337,17 +433,11 @@ pub fn run(
     address: std.net.Address,
     service: T,
 ) !void {
-    const socket = try os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, 0);
-    defer os.close(socket);
+    const tcp_socket = try xev.TCP.init(address);
+    try tcp_socket.bind(address);
+    try tcp_socket.listen(std.os.linux.SOMAXCONN);
 
-    try os.setsockopt(socket, os.SOL.SOCKET, os.SO.REUSEADDR, &mem.toBytes(@as(c_int, 1)));
-    try os.bind(socket, &address.any, address.getOsSockLen());
-    try os.listen(socket, 64);
-
-    var io_ring = try IO.init(32, 0);
-    defer io_ring.deinit();
-
-    var server = try Server(T).init(allocator, &io_ring, socket, service);
+    var server = try Server(T).init(allocator, tcp_socket, service);
     std.log.info("Server started at port {d}", .{address.getPort()});
     try server.run();
 }

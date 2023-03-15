@@ -9,12 +9,21 @@ pub fn build(b: *std.build.Builder) void {
         .optimize = optimize,
     });
 
+    const xev_dep = b.dependency("xev", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const minihttp_mod = b.createModule(.{
         .source_file = .{ .path = "../../src/main.zig" },
         .dependencies = &[_]std.build.ModuleDependency{
             .{
                 .name = "httpparser",
                 .module = httpparser_dep.module("httpparser"),
+            },
+            .{
+                .name = "xev",
+                .module = xev_dep.module("xev"),
             },
         },
     });
