@@ -142,6 +142,8 @@ const HttpCodec = struct {
     }
 };
 
+const BufferPool = std.heap.MemoryPool([4096]u8);
+
 fn Client(comptime T: type) type {
     return struct {
         io_ring: *IO,
@@ -151,13 +153,14 @@ fn Client(comptime T: type) type {
         in_buffer: []u8,
         out_buffer: []u8,
         body_buffer: []u8,
-        all_buffer: []u8,
         service: T,
+        buffer_pool: *BufferPool,
 
         const Self = @This();
 
         fn init(
             allocator: mem.Allocator,
+            buffer_pool: *BufferPool,
             io_ring: *IO,
             socket: os.socket_t,
             service: T,
@@ -165,10 +168,10 @@ fn Client(comptime T: type) type {
             var client = try allocator.create(Client(T));
             errdefer allocator.destroy(client);
 
-            var buffer = try allocator.alloc(u8, 4096 * 3);
-            var in_buffer = buffer[0..4096];
-            var body_buffer = buffer[4096..8192];
-            var out_buffer = buffer[8192..];
+            var in_buffer = try buffer_pool.create();
+            var body_buffer = try buffer_pool.create();
+            var out_buffer = try buffer_pool.create();
+
             client.* = .{
                 .socket = socket,
                 .allocator = allocator,
@@ -176,16 +179,33 @@ fn Client(comptime T: type) type {
                 .in_buffer = in_buffer,
                 .out_buffer = out_buffer,
                 .body_buffer = body_buffer,
-                .all_buffer = buffer,
                 .completion = undefined,
                 .service = service,
+                .buffer_pool = buffer_pool,
             };
 
             return client;
         }
 
         fn deinit(self: *Self) void {
-            self.allocator.free(self.all_buffer);
+            self.buffer_pool.destroy(
+                @alignCast(
+                    BufferPool.item_alignment,
+                    @intToPtr(*[4096]u8, @ptrToInt(self.in_buffer.ptr)),
+                ),
+            );
+            self.buffer_pool.destroy(
+                @alignCast(
+                    BufferPool.item_alignment,
+                    @intToPtr(*[4096]u8, @ptrToInt(self.body_buffer.ptr)),
+                ),
+            );
+            self.buffer_pool.destroy(
+                @alignCast(
+                    BufferPool.item_alignment,
+                    @intToPtr(*[4096]u8, @ptrToInt(self.out_buffer.ptr)),
+                ),
+            );
             self.allocator.destroy(self);
         }
 
@@ -271,16 +291,23 @@ fn Server(comptime T: type) type {
         io_ring: *IO,
         allocator: mem.Allocator,
         service: T,
+        buffer_pool: BufferPool,
 
         const Self = @This();
 
         fn init(allocator: mem.Allocator, io_ring: *IO, socket: os.socket_t, service: T) !Server(T) {
+            const pool = try BufferPool.initPreheated(allocator, 32);
             return .{
                 .io_ring = io_ring,
                 .socket = socket,
                 .allocator = allocator,
                 .service = service,
+                .buffer_pool = pool,
             };
+        }
+
+        fn deinit(self: *Self) void {
+            self.buffer_pool.deinit();
         }
 
         fn run(self: *Self) !void {
@@ -294,7 +321,7 @@ fn Server(comptime T: type) type {
                 std.log.err("Server.acceptCallback - result:: {}", .{err});
                 return;
             };
-            var client = Client(T).init(self.allocator, self.io_ring, client_socket, self.service) catch |err| {
+            var client = Client(T).init(self.allocator, &self.buffer_pool, self.io_ring, client_socket, self.service) catch |err| {
                 std.log.err("Server.acceptCallback - Client.init:: {}", .{err});
                 return;
             };
@@ -315,7 +342,7 @@ pub fn run(
 
     try os.setsockopt(socket, os.SOL.SOCKET, os.SO.REUSEADDR, &mem.toBytes(@as(c_int, 1)));
     try os.bind(socket, &address.any, address.getOsSockLen());
-    try os.listen(socket, 1);
+    try os.listen(socket, 64);
 
     var io_ring = try IO.init(32, 0);
     defer io_ring.deinit();
