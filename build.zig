@@ -8,12 +8,18 @@ pub fn build(b: *std.build.Builder) void {
         .source_file = .{ .path = "src/main.zig" },
     });
 
+    const httpparser_dep = b.dependency("httpparser", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const lib = b.addStaticLibrary(.{
         .name = "minihttp",
         .root_source_file = .{ .path = "src/main.zig" },
         .target = target,
         .optimize = optimize,
     });
+    lib.addModule("httpparser", httpparser_dep.module("httpparser"));
     lib.install();
 
     const main_tests = b.addTest(.{
