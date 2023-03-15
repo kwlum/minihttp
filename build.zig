@@ -13,6 +13,11 @@ pub fn build(b: *std.build.Builder) void {
         .optimize = optimize,
     });
 
+    const xev_dep = b.dependency("xev", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const lib = b.addStaticLibrary(.{
         .name = "minihttp",
         .root_source_file = .{ .path = "src/main.zig" },
@@ -20,6 +25,7 @@ pub fn build(b: *std.build.Builder) void {
         .optimize = optimize,
     });
     lib.addModule("httpparser", httpparser_dep.module("httpparser"));
+    lib.addModule("xev", xev_dep.module("xev"));
     lib.install();
 
     const main_tests = b.addTest(.{
