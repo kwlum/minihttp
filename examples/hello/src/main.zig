@@ -14,7 +14,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    const address = try std.net.Address.parseIp4("127.0.0.1", 8000);
+    const address = try std.net.Address.parseIp4("127.0.0.1", 8080);
     var service = HelloWorldService{};
     try minihttp.run(*HelloWorldService, gpa.allocator(), address, &service);
 }

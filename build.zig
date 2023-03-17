@@ -1,18 +1,38 @@
 const std = @import("std");
 
 pub fn build(b: *std.build.Builder) void {
-    // Standard release options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
-    const mode = b.standardReleaseOptions();
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
 
-    const lib = b.addStaticLibrary("minihttp", "src/main.zig");
-    lib.setBuildMode(mode);
-    lib.addPackagePath("httpparser", "libs/httpparser/src/main.zig");
+    _ = b.addModule("minihttp", .{
+        .source_file = .{ .path = "src/main.zig" },
+    });
+
+    const httpparser_dep = b.dependency("httpparser", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const xev_dep = b.dependency("xev", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const lib = b.addStaticLibrary(.{
+        .name = "minihttp",
+        .root_source_file = .{ .path = "src/main.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    lib.addModule("httpparser", httpparser_dep.module("httpparser"));
+    lib.addModule("xev", xev_dep.module("xev"));
     lib.install();
 
-    const main_tests = b.addTest("src/main.zig");
-    main_tests.setBuildMode(mode);
-
+    const main_tests = b.addTest(.{
+        .root_source_file = .{ .path = "src/main.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&main_tests.step);
 }

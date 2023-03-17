@@ -1,0 +1,14 @@
+.{
+    .name = "hello",
+    .version = "0.0.1",
+    .dependencies = .{
+        .httpparser = .{
+            .url = "https://github.com/kwlum/httpparser/archive/87c7726e11b0356290d43d93f7d0b3892d4e83f2.tar.gz",            
+            .hash = "1220cfbf17911d790d69e86f89f44f75f5ad9559a47204ea9a80a0a79149248c1305",
+        },
+        .xev = .{
+            .url = "https://github.com/mitchellh/libxev/archive/5c8c949c4ac378190599871e1965f43a3fbb8904.tar.gz",
+            .hash = "122065b9d9d5774fbe20f048460db407259a8015307e85f2e42db4f845d4400be59d",
+        },
+    },
+}
