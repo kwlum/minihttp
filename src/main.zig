@@ -206,6 +206,7 @@ fn Client(comptime T: type) type {
 
             const completion = self.completion_pool.create() catch unreachable;
             const read_buffer = self.buffer_pool.create() catch unreachable;
+
             socket.read(
                 ev_loop,
                 completion,
@@ -429,43 +430,6 @@ fn Server(comptime T: type) type {
             self.accept(ev_loop);
 
             return .disarm;
-        }
-    };
-}
-
-fn MutextMemoryPool(comptime T: type) type {
-    return struct {
-        mutex: std.Thread.Mutex,
-        pool: Pool,
-
-        const Self = @This();
-        const Pool = std.heap.MemoryPool(T);
-        const ItemPtr = *align(Pool.item_alignment) T;
-        const item_alignment = Pool.item_alignment;
-
-        fn init(allocator: mem.Allocator) Self {
-            return .{
-                .mutex = .{},
-                .pool = Pool.init(allocator),
-            };
-        }
-
-        fn deinit(self: *Self) void {
-            self.pool.deinit();
-        }
-
-        fn create(self: *Self) !ItemPtr {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
-            return self.pool.create();
-        }
-
-        fn destroy(self: *Self, ptr: ItemPtr) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
-            self.pool.destroy(ptr);
         }
     };
 }
