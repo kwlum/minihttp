@@ -147,40 +147,63 @@ const CompletionPool = std.heap.MemoryPool(xev.Completion);
 
 fn Server(comptime T: type) type {
     return struct {
-        allocator: mem.Allocator,
-        buffer_pool: *BufferPool,
-        completion_pool: *CompletionPool,
+        buffer_pool: BufferPool,
+        completion_pool: CompletionPool,
+        ev_loop: xev.Loop,
         socket: xev.TCP,
         next_id: usize = 0,
         executors: []*Worker(T),
+        thread: ?std.Thread = null,
 
         const Self = @This();
 
         fn init(
             allocator: mem.Allocator,
-            buffer_pool: *BufferPool,
-            completion_pool: *CompletionPool,
             socket: xev.TCP,
             executors: []*Worker(T),
         ) !Server(T) {
+            var ev_loop = try xev.Loop.init(.{});
+
             return .{
-                .allocator = allocator,
-                .buffer_pool = buffer_pool,
-                .completion_pool = completion_pool,
+                .buffer_pool = BufferPool.init(allocator),
+                .completion_pool = CompletionPool.init(allocator),
                 .socket = socket,
+                .ev_loop = ev_loop,
                 .executors = executors,
                 .next_id = 0,
             };
         }
 
-        fn accept(self: *Self, ev_loop: *xev.Loop) void {
+        fn deinit(self: *Self) void {
+            self.ev_loop.deinit();
+            self.completion_pool.deinit();
+            self.buffer_pool.deinit();
+        }
+
+        fn start(self: *Self) !void {
+            self.thread = try std.Thread.spawn(.{}, Self.run, .{self});
+            try self.thread.?.setName("minihttp-server");
+        }
+
+        fn join(self: *Self) void {
+            if (self.thread) |t| t.join();
+        }
+
+        fn run(self: *Self) void {
+            self.accept();
+            self.ev_loop.run(.until_done) catch |err| {
+                std.log.err("Server.run - loop run :: {}", .{err});
+            };
+        }
+
+        fn accept(self: *Self) void {
             const completion = self.completion_pool.create() catch unreachable;
-            self.socket.accept(ev_loop, completion, Self, self, onAccept);
+            self.socket.accept(&self.ev_loop, completion, Self, self, onAccept);
         }
 
         fn onAccept(
             self_: ?*Self,
-            ev_loop: *xev.Loop,
+            _: *xev.Loop,
             completion: *xev.Completion,
             result: xev.AcceptError!xev.TCP,
         ) xev.CallbackAction {
@@ -213,7 +236,7 @@ fn Server(comptime T: type) type {
                 break;
             }
 
-            self.accept(ev_loop);
+            self.accept();
 
             return .disarm;
         }
@@ -272,15 +295,6 @@ fn Worker(comptime T: type) type {
             id: usize,
             socket: xev.TCP,
         ) !void {
-            // var client = try Client(T).init(
-            //     id,
-            //     allocator,
-            //     &self.buffer_pool,
-            //     &self.completion_pool,
-            //     self.service,
-            // );
-
-            // client.receive(&self.ev_loop, socket);
             _ = id;
             self.new_client = socket;
             try self.notifier.notify();
@@ -496,34 +510,26 @@ pub fn run(
     try tcp_socket.bind(address);
     try tcp_socket.listen(std.os.linux.SOMAXCONN);
 
-    var ev_loop = try xev.Loop.init(.{});
-    defer ev_loop.deinit();
-
-    var buffer_pool = BufferPool.init(allocator);
-    var completion_pool = CompletionPool.init(allocator);
-
     var threads: [thread_size]std.Thread = undefined;
-    var executors: [thread_size]*Worker(T) = undefined;
-    for (&executors, &threads) |*a, *t| {
+    var workers: [thread_size]*Worker(T) = undefined;
+    for (&workers, &threads) |*a, *t| {
         a.* = try Worker(T).init(allocator, service);
         t.* = try std.Thread.spawn(.{}, Worker(T).run, .{a.*});
     }
     defer {
-        for (executors) |a| a.deinit();
+        for (workers) |a| a.deinit();
     }
 
     var server = try Server(T).init(
         allocator,
-        &buffer_pool,
-        &completion_pool,
         tcp_socket,
-        &executors,
+        &workers,
     );
 
-    server.accept(&ev_loop);
+    try server.start();
     std.log.info("Server started at port {d}", .{address.getPort()});
 
-    try ev_loop.run(.until_done);
+    server.join();
     for (threads) |t| {
         t.join();
     }
