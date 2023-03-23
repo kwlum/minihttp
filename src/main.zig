@@ -73,7 +73,7 @@ pub const Request = struct {
 pub const Response = struct {
     status: http.Status,
     headers: Headers,
-    body: io.FixedBufferStream([]u8).Writer,
+    body: io.FixedBufferStream([]align(8) u8).Writer,
 };
 
 const HttpCodec = struct {
@@ -145,219 +145,6 @@ const HttpCodec = struct {
 const BufferPool = std.heap.MemoryPool([4096]u8);
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
 
-fn Client(comptime T: type) type {
-    return struct {
-        id: usize,
-        allocator: mem.Allocator,
-        body_buffer: []u8,
-        service: T,
-        buffer_pool: *BufferPool,
-        completion_pool: *CompletionPool,
-
-        const Self = @This();
-
-        fn init(
-            id: usize,
-            allocator: mem.Allocator,
-            buffer_pool: *BufferPool,
-            completion_pool: *CompletionPool,
-            service: T,
-        ) !*Client(T) {
-            var client = try allocator.create(Client(T));
-            errdefer allocator.destroy(client);
-
-            var body_buffer = try buffer_pool.create();
-
-            client.* = .{
-                .id = id,
-                .allocator = allocator,
-                .body_buffer = body_buffer,
-                .service = service,
-                .buffer_pool = buffer_pool,
-                .completion_pool = completion_pool,
-            };
-
-            return client;
-        }
-
-        fn deinit(self: *Self) void {
-            self.destroyBuffer(self.body_buffer);
-            self.allocator.destroy(self);
-        }
-
-        fn destroyBuffer(self: *Self, buffer: []const u8) void {
-            self.buffer_pool.destroy(
-                @alignCast(
-                    BufferPool.item_alignment,
-                    @intToPtr(*[4096]u8, @ptrToInt(buffer.ptr)),
-                ),
-            );
-        }
-
-        fn close(self: *Self, ev_loop: *xev.Loop, socket: xev.TCP) void {
-            std.log.debug("Client[{}].close", .{self.id});
-
-            const completion = self.completion_pool.create() catch unreachable;
-            socket.close(ev_loop, completion, Self, self, onClose);
-        }
-
-        fn receive(self: *Self, ev_loop: *xev.Loop, socket: xev.TCP) void {
-            std.log.debug("Client[{}].receive [{}]", .{ self.id, std.Thread.getCurrentId() });
-
-            const completion = self.completion_pool.create() catch unreachable;
-            const read_buffer = self.buffer_pool.create() catch unreachable;
-
-            socket.read(
-                ev_loop,
-                completion,
-                .{ .slice = read_buffer },
-                Self,
-                self,
-                onReceive,
-            );
-        }
-
-        fn send(
-            self: *Self,
-            ev_loop: *xev.Loop,
-            socket: xev.TCP,
-            buffer: []const u8,
-            write_count: usize,
-        ) void {
-            std.log.debug("Client[{}].send [{}]", .{ self.id, std.Thread.getCurrentId() });
-
-            const completion = self.completion_pool.create() catch unreachable;
-            socket.write(
-                ev_loop,
-                completion,
-                .{ .slice = buffer[0..write_count] },
-                Self,
-                self,
-                onSend,
-            );
-            std.log.debug("Client[{}].send - done", .{self.id});
-        }
-
-        fn onReceive(
-            self_: ?*Self,
-            ev_loop: *xev.Loop,
-            completion: *xev.Completion,
-            socket: xev.TCP,
-            read_buffer: xev.ReadBuffer,
-            result: xev.ReadError!usize,
-        ) xev.CallbackAction {
-            const self = self_.?;
-            std.log.debug("Client[{}].onReceive [{}]", .{ self.id, std.Thread.getCurrentId() });
-            defer {
-                if (completion.state() == .dead) {
-                    self.completion_pool.destroy(completion);
-                }
-
-                self.destroyBuffer(read_buffer.slice);
-            }
-
-            const count = result catch {
-                // std.log.err("Client.onReceive, result :: {}", .{err});
-                self.close(ev_loop, socket);
-                return .disarm;
-            };
-
-            if (count == 0) {
-                self.close(ev_loop, socket);
-                return .disarm;
-            }
-
-            const read_slice = read_buffer.slice;
-
-            // decode buffer.
-            const request = HttpCodec.decode(read_slice[0..count]) catch |err| {
-                std.log.err("Client.onReceive - decode :: {}", .{err});
-                return .disarm;
-            };
-
-            // make response.
-            var body_fbs = io.fixedBufferStream(self.body_buffer);
-            var headers = Headers.init();
-            var response: Response = .{
-                .status = http.Status.ok,
-                .headers = headers,
-                .body = body_fbs.writer(),
-            };
-
-            // call the service.
-            @call(.auto, self.service.handle, .{ request, &response }) catch |err| {
-                std.log.err("Client.dispatchRequest - handle fn :: {}", .{err});
-                return .disarm;
-            };
-
-            const write_buffer = self.buffer_pool.create() catch unreachable;
-            const output = HttpCodec.encode(response, body_fbs.getWritten(), write_buffer) catch |err| {
-                std.log.err("Client.dispatchRequest - HttpCodec.encode :: {}", .{err});
-                return .disarm;
-            };
-
-            self.send(ev_loop, socket, write_buffer, output.len);
-
-            return .disarm;
-        }
-
-        fn onSend(
-            self_: ?*Self,
-            ev_loop: *xev.Loop,
-            completion: *xev.Completion,
-            socket: xev.TCP,
-            write_buffer: xev.WriteBuffer,
-            result: xev.WriteError!usize,
-        ) xev.CallbackAction {
-            const self = self_.?;
-            std.log.debug("Client[{}].onSend [{}]", .{ self.id, std.Thread.getCurrentId() });
-            defer {
-                std.log.debug("onSend - completion :: {}", .{completion.state()});
-                if (completion.state() == .dead) {
-                    self.completion_pool.destroy(completion);
-                }
-
-                self.destroyBuffer(write_buffer.slice);
-            }
-
-            _ = result catch |err| {
-                std.log.err("Client.onSend - result :: {}", .{err});
-                return .disarm;
-            };
-
-            self.receive(ev_loop, socket);
-            return .disarm;
-        }
-
-        fn onClose(
-            self_: ?*Self,
-            _: *xev.Loop,
-            completion: *xev.Completion,
-            _: xev.TCP,
-            result: xev.CloseError!void,
-        ) xev.CallbackAction {
-            const self = self_.?;
-            std.log.debug("Client[{}].onClose [{}]", .{ self.id, std.Thread.getCurrentId() });
-
-            defer {
-                std.log.debug("onClose - completion :: {}", .{completion.state()});
-                if (completion.state() == .dead) {
-                    self.completion_pool.destroy(completion);
-                }
-
-                self.deinit();
-            }
-
-            _ = result catch |err| {
-                std.log.err("Client.onClose, result :: {}", .{err});
-                return .disarm;
-            };
-
-            return .disarm;
-        }
-    };
-}
-
 fn Server(comptime T: type) type {
     return struct {
         allocator: mem.Allocator,
@@ -412,15 +199,19 @@ fn Server(comptime T: type) type {
             };
 
             self.next_id += 1;
-            const index = self.next_id % self.executors.len;
-            self.executors[index].add(
-                self.allocator,
-                self.next_id,
-                client_socket,
-            ) catch |err| {
-                std.log.err("Server.acceptCallback - Client.init:: {}", .{err});
-                return .disarm;
-            };
+            var i: usize = 0;
+            while (i < self.executors.len) : (i += 1) {
+                const index = (self.next_id + i) % self.executors.len;
+                self.executors[index].add(
+                    self.next_id,
+                    client_socket,
+                ) catch |err| {
+                    std.log.err("Server.acceptCallback - Client.init :: {}", .{err});
+                    continue;
+                };
+
+                break;
+            }
 
             self.accept(ev_loop);
 
@@ -437,6 +228,7 @@ fn Worker(comptime T: type) type {
         ev_loop: xev.Loop,
         allocator: mem.Allocator,
         service: T,
+        new_client: ?xev.TCP = null, // TODO(KW): turn this to command queue.
 
         const Self = @This();
 
@@ -466,37 +258,229 @@ fn Worker(comptime T: type) type {
             self.allocator.destroy(self);
         }
 
+        fn destroyBuffer(self: *Self, buffer: []const u8) void {
+            self.buffer_pool.destroy(
+                @alignCast(
+                    BufferPool.item_alignment,
+                    @intToPtr(*[4096]u8, @ptrToInt(buffer.ptr)),
+                ),
+            );
+        }
+
         fn add(
             self: *Self,
-            allocator: mem.Allocator,
             id: usize,
             socket: xev.TCP,
         ) !void {
-            var client = try Client(T).init(
-                id,
-                allocator,
-                &self.buffer_pool,
-                &self.completion_pool,
-                self.service,
-            );
+            // var client = try Client(T).init(
+            //     id,
+            //     allocator,
+            //     &self.buffer_pool,
+            //     &self.completion_pool,
+            //     self.service,
+            // );
 
-            client.receive(&self.ev_loop, socket);
+            // client.receive(&self.ev_loop, socket);
+            _ = id;
+            self.new_client = socket;
             try self.notifier.notify();
         }
 
         fn run(self: *Self) void {
             const completion = self.completion_pool.create() catch unreachable;
-            self.notifier.wait(&self.ev_loop, completion, void, null, onWake);
+            self.notifier.wait(&self.ev_loop, completion, Self, self, onWake);
             self.ev_loop.run(.until_done) catch |err| {
                 std.log.err("Worker.run - ev_loop.run :: {}", .{err});
                 return;
             };
         }
 
-        fn onWake(_: ?*void, _: *xev.Loop, _: *xev.Completion, r: xev.Async.WaitError!void) xev.CallbackAction {
+        fn onWake(
+            self_: ?*Self,
+            ev_loop: *xev.Loop,
+            completion: *xev.Completion,
+            r: xev.Async.WaitError!void,
+        ) xev.CallbackAction {
             _ = r catch unreachable;
+            const self = self_.?;
+            defer self.completion_pool.destroy(completion);
+
             std.log.debug("Worker.onWake [{}]", .{std.Thread.getCurrentId()});
-            return .rearm;
+
+            if (self.new_client) |socket| {
+                self.receive(ev_loop, socket);
+                self.new_client = null;
+            }
+
+            const c = self.completion_pool.create() catch unreachable;
+            self.notifier.wait(ev_loop, c, Self, self, onWake);
+
+            return .disarm;
+        }
+
+        fn receive(self: *Self, ev_loop: *xev.Loop, socket: xev.TCP) void {
+            std.log.debug("Worker.receive [{}]", .{std.Thread.getCurrentId()});
+
+            const completion = self.completion_pool.create() catch unreachable;
+            const read_buffer = self.buffer_pool.create() catch unreachable;
+
+            socket.read(
+                ev_loop,
+                completion,
+                .{ .slice = read_buffer },
+                Self,
+                self,
+                onReceive,
+            );
+        }
+
+        fn onReceive(
+            self_: ?*Self,
+            ev_loop: *xev.Loop,
+            completion: *xev.Completion,
+            socket: xev.TCP,
+            read_buffer: xev.ReadBuffer,
+            result: xev.ReadError!usize,
+        ) xev.CallbackAction {
+            const self = self_.?;
+            std.log.debug("Worker.onReceive [{}]", .{std.Thread.getCurrentId()});
+            defer {
+                if (completion.state() == .dead) {
+                    self.completion_pool.destroy(completion);
+                }
+
+                self.destroyBuffer(read_buffer.slice);
+            }
+
+            const count = result catch {
+                // std.log.err("Client.onReceive, result :: {}", .{err});
+                self.close(ev_loop, socket);
+                return .disarm;
+            };
+
+            if (count == 0) {
+                self.close(ev_loop, socket);
+                return .disarm;
+            }
+
+            const read_slice = read_buffer.slice;
+
+            // decode buffer.
+            const request = HttpCodec.decode(read_slice[0..count]) catch |err| {
+                std.log.err("Client.onReceive - decode :: {}", .{err});
+                return .disarm;
+            };
+
+            // make response.
+            const buffer = self.buffer_pool.create() catch |err| {
+                std.log.err("Client.onReceive - create buffer :: {}", .{err});
+                return .disarm;
+            };
+            defer self.destroyBuffer(buffer);
+
+            var body_fbs = io.fixedBufferStream(buffer);
+            var headers = Headers.init();
+            var response: Response = .{
+                .status = http.Status.ok,
+                .headers = headers,
+                .body = body_fbs.writer(),
+            };
+
+            // call the service.
+            @call(.auto, self.service.handle, .{ request, &response }) catch |err| {
+                std.log.err("Client.dispatchRequest - handle fn :: {}", .{err});
+                return .disarm;
+            };
+
+            const write_buffer = self.buffer_pool.create() catch unreachable;
+            const output = HttpCodec.encode(response, body_fbs.getWritten(), write_buffer) catch |err| {
+                std.log.err("Client.dispatchRequest - HttpCodec.encode :: {}", .{err});
+                return .disarm;
+            };
+
+            self.send(ev_loop, socket, write_buffer, output.len);
+
+            return .disarm;
+        }
+
+        fn send(
+            self: *Self,
+            ev_loop: *xev.Loop,
+            socket: xev.TCP,
+            buffer: []const u8,
+            write_count: usize,
+        ) void {
+            std.log.debug("Worker.send [{}]", .{std.Thread.getCurrentId()});
+
+            const completion = self.completion_pool.create() catch unreachable;
+            socket.write(
+                ev_loop,
+                completion,
+                .{ .slice = buffer[0..write_count] },
+                Self,
+                self,
+                onSend,
+            );
+        }
+
+        fn onSend(
+            self_: ?*Self,
+            ev_loop: *xev.Loop,
+            completion: *xev.Completion,
+            socket: xev.TCP,
+            write_buffer: xev.WriteBuffer,
+            result: xev.WriteError!usize,
+        ) xev.CallbackAction {
+            const self = self_.?;
+            std.log.debug("Worker.onSend [{}]", .{std.Thread.getCurrentId()});
+            defer {
+                std.log.debug("onSend - completion :: {}", .{completion.state()});
+                if (completion.state() == .dead) {
+                    self.completion_pool.destroy(completion);
+                }
+
+                self.destroyBuffer(write_buffer.slice);
+            }
+
+            _ = result catch |err| {
+                std.log.err("Client.onSend - result :: {}", .{err});
+                return .disarm;
+            };
+
+            self.receive(ev_loop, socket);
+            return .disarm;
+        }
+
+        fn close(self: *Self, ev_loop: *xev.Loop, socket: xev.TCP) void {
+            std.log.debug("Worker.close", .{});
+
+            const completion = self.completion_pool.create() catch unreachable;
+            socket.close(ev_loop, completion, Self, self, onClose);
+        }
+
+        fn onClose(
+            self_: ?*Self,
+            _: *xev.Loop,
+            completion: *xev.Completion,
+            _: xev.TCP,
+            result: xev.CloseError!void,
+        ) xev.CallbackAction {
+            const self = self_.?;
+            std.log.debug("Worker.onClose [{}]", .{std.Thread.getCurrentId()});
+
+            defer {
+                std.log.debug("onClose - completion :: {}", .{completion.state()});
+                if (completion.state() == .dead) {
+                    self.completion_pool.destroy(completion);
+                }
+            }
+
+            _ = result catch |err| {
+                std.log.err("Client.onClose, result :: {}", .{err});
+                return .disarm;
+            };
+
+            return .disarm;
         }
     };
 }
