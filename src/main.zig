@@ -152,7 +152,7 @@ fn Server(comptime T: type) type {
         ev_loop: xev.Loop,
         socket: xev.TCP,
         next_id: usize = 0,
-        executors: []*Worker(T),
+        workers: []*Worker(T),
         thread: ?std.Thread = null,
 
         const Self = @This();
@@ -160,7 +160,7 @@ fn Server(comptime T: type) type {
         fn init(
             allocator: mem.Allocator,
             socket: xev.TCP,
-            executors: []*Worker(T),
+            workers: []*Worker(T),
         ) !Server(T) {
             var ev_loop = try xev.Loop.init(.{});
 
@@ -169,7 +169,7 @@ fn Server(comptime T: type) type {
                 .completion_pool = CompletionPool.init(allocator),
                 .socket = socket,
                 .ev_loop = ev_loop,
-                .executors = executors,
+                .workers = workers,
                 .next_id = 0,
             };
         }
@@ -217,19 +217,19 @@ fn Server(comptime T: type) type {
             }
 
             const client_socket = result catch |err| {
-                std.log.err("Server.acceptCallback - result:: {}", .{err});
+                std.log.err("Server.onAccept - result :: {}", .{err});
                 return .disarm;
             };
 
             self.next_id += 1;
             var i: usize = 0;
-            while (i < self.executors.len) : (i += 1) {
-                const index = (self.next_id + i) % self.executors.len;
-                self.executors[index].add(
+            while (i < self.workers.len) : (i += 1) {
+                const index = (self.next_id + i) % self.workers.len;
+                self.workers[index].add(
                     self.next_id,
                     client_socket,
                 ) catch |err| {
-                    std.log.err("Server.acceptCallback - Client.init :: {}", .{err});
+                    std.log.err("Server.onAccept - add client to worker :: {}", .{err});
                     continue;
                 };
 
@@ -257,21 +257,25 @@ fn Worker(comptime T: type) type {
         const Self = @This();
 
         fn init(allocator: mem.Allocator, service: T) !*Self {
-            var executor = try allocator.create(Self);
-            errdefer allocator.destroy(executor);
+            var worker = try allocator.create(Self);
+            errdefer allocator.destroy(worker);
 
-            executor.ev_loop = try xev.Loop.init(.{});
-            errdefer executor.ev_loop.deinit();
+            var ev_loop = try xev.Loop.init(.{});
+            errdefer ev_loop.deinit();
 
-            executor.notifier = try xev.Async.init();
-            errdefer executor.notifier.deinit();
+            var notifier = try xev.Async.init();
+            errdefer notifier.deinit();
 
-            executor.completion_pool = CompletionPool.init(allocator);
-            executor.buffer_pool = BufferPool.init(allocator);
-            executor.allocator = allocator;
-            executor.service = service;
+            worker.* = .{
+                .completion_pool = CompletionPool.init(allocator),
+                .buffer_pool = BufferPool.init(allocator),
+                .allocator = allocator,
+                .service = service,
+                .ev_loop = ev_loop,
+                .notifier = notifier,
+            };
 
-            return executor;
+            return worker;
         }
 
         fn deinit(self: *Self) void {
@@ -391,13 +395,13 @@ fn Worker(comptime T: type) type {
 
             // decode buffer.
             const request = HttpCodec.decode(read_slice[0..count]) catch |err| {
-                std.log.err("Client.onReceive - decode :: {}", .{err});
+                std.log.err("Worker.onReceive - decode :: {}", .{err});
                 return .disarm;
             };
 
             // make response.
             const buffer = self.buffer_pool.create() catch |err| {
-                std.log.err("Client.onReceive - create buffer :: {}", .{err});
+                std.log.err("Worker.onReceive - create buffer :: {}", .{err});
                 return .disarm;
             };
             defer self.destroyBuffer(buffer);
@@ -412,13 +416,13 @@ fn Worker(comptime T: type) type {
 
             // call the service.
             @call(.auto, self.service.handle, .{ request, &response }) catch |err| {
-                std.log.err("Client.dispatchRequest - handle fn :: {}", .{err});
+                std.log.err("Worker.dispatchRequest - handle fn :: {}", .{err});
                 return .disarm;
             };
 
             const write_buffer = self.buffer_pool.create() catch unreachable;
             const output = HttpCodec.encode(response, body_fbs.getWritten(), write_buffer) catch |err| {
-                std.log.err("Client.dispatchRequest - HttpCodec.encode :: {}", .{err});
+                std.log.err("Worker.dispatchRequest - HttpCodec.encode :: {}", .{err});
                 return .disarm;
             };
 
@@ -458,11 +462,7 @@ fn Worker(comptime T: type) type {
             const self = self_.?;
             std.log.debug("Worker.onSend [{}]", .{std.Thread.getCurrentId()});
             defer {
-                std.log.debug("onSend - completion :: {}", .{completion.state()});
-                if (completion.state() == .dead) {
-                    self.completion_pool.destroy(completion);
-                }
-
+                self.completion_pool.destroy(completion);
                 self.destroyBuffer(write_buffer.slice);
             }
 
@@ -492,12 +492,7 @@ fn Worker(comptime T: type) type {
             const self = self_.?;
             std.log.debug("Worker.onClose [{}]", .{std.Thread.getCurrentId()});
 
-            defer {
-                std.log.debug("onClose - completion :: {}", .{completion.state()});
-                if (completion.state() == .dead) {
-                    self.completion_pool.destroy(completion);
-                }
-            }
+            defer self.completion_pool.destroy(completion);
 
             _ = result catch |err| {
                 std.log.err("Client.onClose, result :: {}", .{err});
