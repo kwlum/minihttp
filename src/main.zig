@@ -364,9 +364,8 @@ fn Server(comptime T: type) type {
         buffer_pool: *BufferPool,
         completion_pool: *CompletionPool,
         socket: xev.TCP,
-        service: T,
         next_id: usize = 0,
-        executors: []*Worker,
+        executors: []*Worker(T),
 
         const Self = @This();
 
@@ -375,12 +374,10 @@ fn Server(comptime T: type) type {
             buffer_pool: *BufferPool,
             completion_pool: *CompletionPool,
             socket: xev.TCP,
-            executors: []*Worker,
-            service: T,
+            executors: []*Worker(T),
         ) !Server(T) {
             return .{
                 .allocator = allocator,
-                .service = service,
                 .buffer_pool = buffer_pool,
                 .completion_pool = completion_pool,
                 .socket = socket,
@@ -417,8 +414,6 @@ fn Server(comptime T: type) type {
             self.next_id += 1;
             const index = self.next_id % self.executors.len;
             self.executors[index].add(
-                T,
-                self.service,
                 self.allocator,
                 self.next_id,
                 client_socket,
@@ -434,75 +429,77 @@ fn Server(comptime T: type) type {
     };
 }
 
-const Worker = struct {
-    completion_pool: CompletionPool,
-    buffer_pool: BufferPool,
-    notifier: xev.Async,
-    ev_loop: xev.Loop,
-    allocator: mem.Allocator,
-
-    const Self = @This();
-
-    fn init(allocator: mem.Allocator) !*Worker {
-        var executor = try allocator.create(Worker);
-        errdefer allocator.destroy(executor);
-
-        executor.ev_loop = try xev.Loop.init(.{});
-        errdefer executor.ev_loop.deinit();
-
-        executor.notifier = try xev.Async.init();
-        errdefer executor.notifier.deinit();
-
-        executor.completion_pool = CompletionPool.init(allocator);
-        executor.buffer_pool = BufferPool.init(allocator);
-        executor.allocator = allocator;
-
-        return executor;
-    }
-
-    fn deinit(self: *Worker) void {
-        self.notifier.deinit();
-        self.ev_loop.deinit();
-        self.completion_pool.deinit();
-        self.buffer_pool.deinit();
-        self.allocator.destroy(self);
-    }
-
-    fn add(
-        self: *Worker,
-        comptime T: type,
-        service: T,
+fn Worker(comptime T: type) type {
+    return struct {
+        completion_pool: CompletionPool,
+        buffer_pool: BufferPool,
+        notifier: xev.Async,
+        ev_loop: xev.Loop,
         allocator: mem.Allocator,
-        id: usize,
-        socket: xev.TCP,
-    ) !void {
-        var client = try Client(T).init(
-            id,
-            allocator,
-            &self.buffer_pool,
-            &self.completion_pool,
-            service,
-        );
+        service: T,
 
-        client.receive(&self.ev_loop, socket);
-        try self.notifier.notify();
-    }
+        const Self = @This();
 
-    fn run(self: *Worker) void {
-        const completion = self.completion_pool.create() catch unreachable;
-        self.notifier.wait(&self.ev_loop, completion, void, null, onWake);
-        self.ev_loop.run(.until_done) catch |err| {
-            std.log.err("Worker.run - ev_loop.run :: {}", .{err});
-            return;
-        };
-    }
+        fn init(allocator: mem.Allocator, service: T) !*Self {
+            var executor = try allocator.create(Self);
+            errdefer allocator.destroy(executor);
 
-    fn onWake(_: ?*void, _: *xev.Loop, _: *xev.Completion, r: xev.Async.WaitError!void) xev.CallbackAction {
-        _ = r catch unreachable;
-        std.log.debug("Worker.onWake [{}]", .{std.Thread.getCurrentId()});
-        return .rearm;
-    }
-};
+            executor.ev_loop = try xev.Loop.init(.{});
+            errdefer executor.ev_loop.deinit();
+
+            executor.notifier = try xev.Async.init();
+            errdefer executor.notifier.deinit();
+
+            executor.completion_pool = CompletionPool.init(allocator);
+            executor.buffer_pool = BufferPool.init(allocator);
+            executor.allocator = allocator;
+            executor.service = service;
+
+            return executor;
+        }
+
+        fn deinit(self: *Self) void {
+            self.notifier.deinit();
+            self.ev_loop.deinit();
+            self.completion_pool.deinit();
+            self.buffer_pool.deinit();
+            self.allocator.destroy(self);
+        }
+
+        fn add(
+            self: *Self,
+            allocator: mem.Allocator,
+            id: usize,
+            socket: xev.TCP,
+        ) !void {
+            var client = try Client(T).init(
+                id,
+                allocator,
+                &self.buffer_pool,
+                &self.completion_pool,
+                self.service,
+            );
+
+            client.receive(&self.ev_loop, socket);
+            try self.notifier.notify();
+        }
+
+        fn run(self: *Self) void {
+            const completion = self.completion_pool.create() catch unreachable;
+            self.notifier.wait(&self.ev_loop, completion, void, null, onWake);
+            self.ev_loop.run(.until_done) catch |err| {
+                std.log.err("Worker.run - ev_loop.run :: {}", .{err});
+                return;
+            };
+        }
+
+        fn onWake(_: ?*void, _: *xev.Loop, _: *xev.Completion, r: xev.Async.WaitError!void) xev.CallbackAction {
+            _ = r catch unreachable;
+            std.log.debug("Worker.onWake [{}]", .{std.Thread.getCurrentId()});
+            return .rearm;
+        }
+    };
+}
 
 pub fn run(
     comptime T: type,
@@ -522,10 +519,10 @@ pub fn run(
     var completion_pool = CompletionPool.init(allocator);
 
     var threads: [thread_size]std.Thread = undefined;
-    var executors: [thread_size]*Worker = undefined;
+    var executors: [thread_size]*Worker(T) = undefined;
     for (&executors, &threads) |*a, *t| {
-        a.* = try Worker.init(allocator);
-        t.* = try std.Thread.spawn(.{}, Worker.run, .{a.*});
+        a.* = try Worker(T).init(allocator, service);
+        t.* = try std.Thread.spawn(.{}, Worker(T).run, .{a.*});
     }
     defer {
         for (executors) |a| a.deinit();
@@ -537,7 +534,6 @@ pub fn run(
         &completion_pool,
         tcp_socket,
         &executors,
-        service,
     );
 
     server.accept(&ev_loop);
