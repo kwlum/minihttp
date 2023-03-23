@@ -435,14 +435,12 @@ fn Server(comptime T: type) type {
 }
 
 const Worker = struct {
-    completion_pool: ClientCompletionPool,
-    buffer_pool: ClientBufferPool,
+    completion_pool: CompletionPool,
+    buffer_pool: BufferPool,
     notifier: xev.Async,
     ev_loop: xev.Loop,
     allocator: mem.Allocator,
 
-    const ClientBufferPool = std.heap.MemoryPool([4096]u8);
-    const ClientCompletionPool = std.heap.MemoryPool(xev.Completion);
     const Self = @This();
 
     fn init(allocator: mem.Allocator) !*Worker {
@@ -455,8 +453,8 @@ const Worker = struct {
         executor.notifier = try xev.Async.init();
         errdefer executor.notifier.deinit();
 
-        executor.completion_pool = ClientCompletionPool.init(allocator);
-        executor.buffer_pool = ClientBufferPool.init(allocator);
+        executor.completion_pool = CompletionPool.init(allocator);
+        executor.buffer_pool = BufferPool.init(allocator);
         executor.allocator = allocator;
 
         return executor;
