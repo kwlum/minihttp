@@ -252,6 +252,7 @@ fn Worker(comptime T: type) type {
         allocator: mem.Allocator,
         service: T,
         new_client: ?xev.TCP = null, // TODO(KW): turn this to command queue.
+        thread: ?std.Thread = null,
 
         const Self = @This();
 
@@ -279,6 +280,15 @@ fn Worker(comptime T: type) type {
             self.completion_pool.deinit();
             self.buffer_pool.deinit();
             self.allocator.destroy(self);
+        }
+
+        fn start(self: *Self) !void {
+            self.thread = try std.Thread.spawn(.{}, Self.run, .{self});
+            try self.thread.?.setName("minihttp-worker");
+        }
+
+        fn join(self: *Self) void {
+            if (self.thread) |t| t.join();
         }
 
         fn destroyBuffer(self: *Self, buffer: []const u8) void {
@@ -510,27 +520,21 @@ pub fn run(
     try tcp_socket.bind(address);
     try tcp_socket.listen(std.os.linux.SOMAXCONN);
 
-    var threads: [thread_size]std.Thread = undefined;
     var workers: [thread_size]*Worker(T) = undefined;
-    for (&workers, &threads) |*a, *t| {
+    for (&workers, 0..) |*a, i| {
         a.* = try Worker(T).init(allocator, service);
-        t.* = try std.Thread.spawn(.{}, Worker(T).run, .{a.*});
+        a.*.start() catch |err| {
+            std.log.err("minihttp.run - can't start worker[{}] :: {}", .{ i, err });
+        };
     }
-    defer {
-        for (workers) |a| a.deinit();
-    }
+    defer for (workers) |a| a.deinit();
 
-    var server = try Server(T).init(
-        allocator,
-        tcp_socket,
-        &workers,
-    );
+    var server = try Server(T).init(allocator, tcp_socket, &workers);
+    defer server.deinit();
 
     try server.start();
     std.log.info("Server started at port {d}", .{address.getPort()});
 
     server.join();
-    for (threads) |t| {
-        t.join();
-    }
+    for (workers) |t| t.join();
 }
