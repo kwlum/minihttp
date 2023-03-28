@@ -7,8 +7,8 @@
             .hash = "1220cfbf17911d790d69e86f89f44f75f5ad9559a47204ea9a80a0a79149248c1305",
         },
         .xev = .{
-            .url = "https://github.com/mitchellh/libxev/archive/5c8c949c4ac378190599871e1965f43a3fbb8904.tar.gz",
-            .hash = "122065b9d9d5774fbe20f048460db407259a8015307e85f2e42db4f845d4400be59d",
+            .url = "https://github.com/mitchellh/libxev/archive/98ab8b3fa0169859c289d3d690068994422bdbdf.tar.gz",            
+            .hash = "1220f8c53b1d2465358aa4b913ca6cdb0e5b260c66417bc54069fe6644d9a906be16",
         },
     },
 }

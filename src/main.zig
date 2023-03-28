@@ -73,7 +73,7 @@ pub const Request = struct {
 pub const Response = struct {
     status: http.Status,
     headers: Headers,
-    body: io.FixedBufferStream([]u8).Writer,
+    body: io.FixedBufferStream([]align(8) u8).Writer,
 };
 
 const HttpCodec = struct {
@@ -145,44 +145,159 @@ const HttpCodec = struct {
 const BufferPool = std.heap.MemoryPool([4096]u8);
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
 
-fn Client(comptime T: type) type {
+fn Server(comptime T: type) type {
     return struct {
-        id: usize,
-        allocator: mem.Allocator,
-        body_buffer: []u8,
-        service: T,
-        buffer_pool: *BufferPool,
-        completion_pool: *CompletionPool,
+        buffer_pool: BufferPool,
+        completion_pool: CompletionPool,
+        ev_loop: xev.Loop,
+        socket: xev.TCP,
+        next_id: usize = 0,
+        workers: []*Worker(T),
+        thread: ?std.Thread = null,
 
         const Self = @This();
 
         fn init(
-            id: usize,
             allocator: mem.Allocator,
-            buffer_pool: *BufferPool,
-            completion_pool: *CompletionPool,
-            service: T,
-        ) !*Client(T) {
-            var client = try allocator.create(Client(T));
-            errdefer allocator.destroy(client);
+            socket: xev.TCP,
+            workers: []*Worker(T),
+        ) !Server(T) {
+            var ev_loop = try xev.Loop.init(.{});
 
-            var body_buffer = try buffer_pool.create();
-
-            client.* = .{
-                .id = id,
-                .allocator = allocator,
-                .body_buffer = body_buffer,
-                .service = service,
-                .buffer_pool = buffer_pool,
-                .completion_pool = completion_pool,
+            return .{
+                .buffer_pool = BufferPool.init(allocator),
+                .completion_pool = CompletionPool.init(allocator),
+                .socket = socket,
+                .ev_loop = ev_loop,
+                .workers = workers,
+                .next_id = 0,
             };
-
-            return client;
         }
 
         fn deinit(self: *Self) void {
-            self.destroyBuffer(self.body_buffer);
+            self.ev_loop.deinit();
+            self.completion_pool.deinit();
+            self.buffer_pool.deinit();
+        }
+
+        fn start(self: *Self) !void {
+            self.thread = try std.Thread.spawn(.{}, Self.run, .{self});
+            try self.thread.?.setName("minihttp-server");
+        }
+
+        fn join(self: *Self) void {
+            if (self.thread) |t| t.join();
+        }
+
+        fn run(self: *Self) void {
+            self.accept();
+            self.ev_loop.run(.until_done) catch |err| {
+                std.log.err("Server.run - loop run :: {}", .{err});
+            };
+        }
+
+        fn accept(self: *Self) void {
+            const completion = self.completion_pool.create() catch unreachable;
+            self.socket.accept(&self.ev_loop, completion, Self, self, onAccept);
+        }
+
+        fn onAccept(
+            self_: ?*Self,
+            _: *xev.Loop,
+            completion: *xev.Completion,
+            result: xev.AcceptError!xev.TCP,
+        ) xev.CallbackAction {
+            const self = self_.?;
+            std.log.debug("Server.onAccept [{}]", .{std.Thread.getCurrentId()});
+
+            defer {
+                if (completion.state() == .dead) {
+                    self.completion_pool.destroy(completion);
+                }
+            }
+
+            const client_socket = result catch |err| {
+                std.log.err("Server.onAccept - result :: {}", .{err});
+                return .disarm;
+            };
+
+            self.next_id += 1;
+            var i: usize = 0;
+            while (i < self.workers.len) : (i += 1) {
+                const index = (self.next_id + i) % self.workers.len;
+                self.workers[index].add(
+                    self.next_id,
+                    client_socket,
+                ) catch |err| {
+                    std.log.err("Server.onAccept - add client to worker :: {}", .{err});
+                    continue;
+                };
+
+                break;
+            }
+
+            self.accept();
+
+            return .disarm;
+        }
+    };
+}
+
+const Command = union(enum) {
+    new_client: xev.TCP,
+};
+
+fn Worker(comptime T: type) type {
+    return struct {
+        completion_pool: CompletionPool,
+        buffer_pool: BufferPool,
+        notifier: xev.Async,
+        ev_loop: xev.Loop,
+        allocator: mem.Allocator,
+        service: T,
+        commands: std.atomic.Queue(Command),
+        thread: ?std.Thread = null,
+
+        const Self = @This();
+
+        fn init(allocator: mem.Allocator, service: T) !*Self {
+            var worker = try allocator.create(Self);
+            errdefer allocator.destroy(worker);
+
+            var ev_loop = try xev.Loop.init(.{});
+            errdefer ev_loop.deinit();
+
+            var notifier = try xev.Async.init();
+            errdefer notifier.deinit();
+
+            worker.* = .{
+                .completion_pool = CompletionPool.init(allocator),
+                .buffer_pool = BufferPool.init(allocator),
+                .commands = std.atomic.Queue(Command).init(),
+                .allocator = allocator,
+                .service = service,
+                .ev_loop = ev_loop,
+                .notifier = notifier,
+            };
+
+            return worker;
+        }
+
+        fn deinit(self: *Self) void {
+            self.notifier.deinit();
+            self.ev_loop.deinit();
+            self.completion_pool.deinit();
+            self.buffer_pool.deinit();
             self.allocator.destroy(self);
+        }
+
+        fn start(self: *Self) !void {
+            self.thread = try std.Thread.spawn(.{}, Self.run, .{self});
+            try self.thread.?.setName("minihttp-worker");
+        }
+
+        fn join(self: *Self) void {
+            if (self.thread) |t| t.join();
         }
 
         fn destroyBuffer(self: *Self, buffer: []const u8) void {
@@ -194,18 +309,66 @@ fn Client(comptime T: type) type {
             );
         }
 
-        fn close(self: *Self, ev_loop: *xev.Loop, socket: xev.TCP) void {
-            std.log.debug("Client[{}].close", .{self.id});
+        fn add(
+            self: *Self,
+            id: usize,
+            socket: xev.TCP,
+        ) !void {
+            _ = id;
+            const node = try self.allocator.create(std.TailQueue(Command).Node);
+            node.* = .{
+                .prev = null,
+                .next = null,
+                .data = .{ .new_client = socket },
+            };
+            self.commands.put(node);
+            try self.notifier.notify();
+        }
 
+        fn run(self: *Self) void {
             const completion = self.completion_pool.create() catch unreachable;
-            socket.close(ev_loop, completion, Self, self, onClose);
+            self.notifier.wait(&self.ev_loop, completion, Self, self, onWake);
+            self.ev_loop.run(.until_done) catch |err| {
+                std.log.err("Worker.run - ev_loop.run :: {}", .{err});
+                return;
+            };
+        }
+
+        fn onWake(
+            self_: ?*Self,
+            ev_loop: *xev.Loop,
+            completion: *xev.Completion,
+            r: xev.Async.WaitError!void,
+        ) xev.CallbackAction {
+            _ = r catch unreachable;
+            const self = self_.?;
+            defer self.completion_pool.destroy(completion);
+
+            std.log.debug("Worker.onWake [{}]", .{std.Thread.getCurrentId()});
+
+            while (self.commands.get()) |node| {
+                defer self.allocator.destroy(node);
+                const command = node.data;
+
+                switch (command) {
+                    .new_client => |socket| {
+                        self.receive(ev_loop, socket);
+                    },
+                }
+            }
+
+            const c = self.completion_pool.create() catch unreachable;
+            self.notifier.wait(ev_loop, c, Self, self, onWake);
+
+            return .disarm;
         }
 
         fn receive(self: *Self, ev_loop: *xev.Loop, socket: xev.TCP) void {
-            std.log.debug("Client[{}].receive [{}]", .{ self.id, std.Thread.getCurrentId() });
+            std.log.debug("Worker.receive [{}]", .{std.Thread.getCurrentId()});
 
             const completion = self.completion_pool.create() catch unreachable;
             const read_buffer = self.buffer_pool.create() catch unreachable;
+
             socket.read(
                 ev_loop,
                 completion,
@@ -214,27 +377,6 @@ fn Client(comptime T: type) type {
                 self,
                 onReceive,
             );
-        }
-
-        fn send(
-            self: *Self,
-            ev_loop: *xev.Loop,
-            socket: xev.TCP,
-            buffer: []const u8,
-            write_count: usize,
-        ) void {
-            std.log.debug("Client[{}].send [{}]", .{ self.id, std.Thread.getCurrentId() });
-
-            const completion = self.completion_pool.create() catch unreachable;
-            socket.write(
-                ev_loop,
-                completion,
-                .{ .slice = buffer[0..write_count] },
-                Self,
-                self,
-                onSend,
-            );
-            std.log.debug("Client[{}].send - done", .{self.id});
         }
 
         fn onReceive(
@@ -246,7 +388,7 @@ fn Client(comptime T: type) type {
             result: xev.ReadError!usize,
         ) xev.CallbackAction {
             const self = self_.?;
-            std.log.debug("Client[{}].onReceive [{}]", .{ self.id, std.Thread.getCurrentId() });
+            std.log.debug("Worker.onReceive [{}]", .{std.Thread.getCurrentId()});
             defer {
                 if (completion.state() == .dead) {
                     self.completion_pool.destroy(completion);
@@ -270,12 +412,18 @@ fn Client(comptime T: type) type {
 
             // decode buffer.
             const request = HttpCodec.decode(read_slice[0..count]) catch |err| {
-                std.log.err("Client.onTask - decode :: {}", .{err});
+                std.log.err("Worker.onReceive - decode :: {}", .{err});
                 return .disarm;
             };
 
             // make response.
-            var body_fbs = io.fixedBufferStream(self.body_buffer);
+            const buffer = self.buffer_pool.create() catch |err| {
+                std.log.err("Worker.onReceive - create buffer :: {}", .{err});
+                return .disarm;
+            };
+            defer self.destroyBuffer(buffer);
+
+            var body_fbs = io.fixedBufferStream(buffer);
             var headers = Headers.init();
             var response: Response = .{
                 .status = http.Status.ok,
@@ -285,19 +433,39 @@ fn Client(comptime T: type) type {
 
             // call the service.
             @call(.auto, self.service.handle, .{ request, &response }) catch |err| {
-                std.log.err("Client.dispatchRequest - handle fn :: {}", .{err});
+                std.log.err("Worker.dispatchRequest - handle fn :: {}", .{err});
                 return .disarm;
             };
 
             const write_buffer = self.buffer_pool.create() catch unreachable;
             const output = HttpCodec.encode(response, body_fbs.getWritten(), write_buffer) catch |err| {
-                std.log.err("Client.dispatchRequest - HttpCodec.encode :: {}", .{err});
+                std.log.err("Worker.dispatchRequest - HttpCodec.encode :: {}", .{err});
                 return .disarm;
             };
 
             self.send(ev_loop, socket, write_buffer, output.len);
 
             return .disarm;
+        }
+
+        fn send(
+            self: *Self,
+            ev_loop: *xev.Loop,
+            socket: xev.TCP,
+            buffer: []const u8,
+            write_count: usize,
+        ) void {
+            std.log.debug("Worker.send [{}]", .{std.Thread.getCurrentId()});
+
+            const completion = self.completion_pool.create() catch unreachable;
+            socket.write(
+                ev_loop,
+                completion,
+                .{ .slice = buffer[0..write_count] },
+                Self,
+                self,
+                onSend,
+            );
         }
 
         fn onSend(
@@ -309,13 +477,9 @@ fn Client(comptime T: type) type {
             result: xev.WriteError!usize,
         ) xev.CallbackAction {
             const self = self_.?;
-            std.log.debug("Client[{}].onSend [{}]", .{ self.id, std.Thread.getCurrentId() });
+            std.log.debug("Worker.onSend [{}]", .{std.Thread.getCurrentId()});
             defer {
-                std.log.debug("onSend - completion :: {}", .{completion.state()});
-                if (completion.state() == .dead) {
-                    self.completion_pool.destroy(completion);
-                }
-
+                self.completion_pool.destroy(completion);
                 self.destroyBuffer(write_buffer.slice);
             }
 
@@ -328,6 +492,13 @@ fn Client(comptime T: type) type {
             return .disarm;
         }
 
+        fn close(self: *Self, ev_loop: *xev.Loop, socket: xev.TCP) void {
+            std.log.debug("Worker.close", .{});
+
+            const completion = self.completion_pool.create() catch unreachable;
+            socket.close(ev_loop, completion, Self, self, onClose);
+        }
+
         fn onClose(
             self_: ?*Self,
             _: *xev.Loop,
@@ -336,16 +507,9 @@ fn Client(comptime T: type) type {
             result: xev.CloseError!void,
         ) xev.CallbackAction {
             const self = self_.?;
-            std.log.debug("Client[{}].onClose [{}]", .{ self.id, std.Thread.getCurrentId() });
+            std.log.debug("Worker.onClose [{}]", .{std.Thread.getCurrentId()});
 
-            defer {
-                std.log.debug("onClose - completion :: {}", .{completion.state()});
-                if (completion.state() == .dead) {
-                    self.completion_pool.destroy(completion);
-                }
-
-                self.deinit();
-            }
+            defer self.completion_pool.destroy(completion);
 
             _ = result catch |err| {
                 std.log.err("Client.onClose, result :: {}", .{err});
@@ -357,97 +521,32 @@ fn Client(comptime T: type) type {
     };
 }
 
-fn Server(comptime T: type) type {
-    return struct {
-        allocator: mem.Allocator,
-        buffer_pool: *BufferPool,
-        completion_pool: *CompletionPool,
-        socket: xev.TCP,
-        service: T,
-        next_id: usize = 0,
-
-        const Self = @This();
-
-        fn init(
-            allocator: mem.Allocator,
-            buffer_pool: *BufferPool,
-            completion_pool: *CompletionPool,
-            socket: xev.TCP,
-            service: T,
-        ) !Server(T) {
-            return .{
-                .allocator = allocator,
-                .service = service,
-                .buffer_pool = buffer_pool,
-                .completion_pool = completion_pool,
-                .socket = socket,
-                .next_id = 0,
-            };
-        }
-
-        fn accept(self: *Self, ev_loop: *xev.Loop) void {
-            const completion = self.completion_pool.create() catch unreachable;
-            self.socket.accept(ev_loop, completion, Self, self, onAccept);
-        }
-
-        fn onAccept(
-            self_: ?*Self,
-            ev_loop: *xev.Loop,
-            completion: *xev.Completion,
-            result: xev.AcceptError!xev.TCP,
-        ) xev.CallbackAction {
-            const self = self_.?;
-            std.log.debug("Server.onAccept [{}]", .{std.Thread.getCurrentId()});
-
-            defer {
-                if (completion.state() == .dead) {
-                    self.completion_pool.destroy(completion);
-                }
-            }
-
-            const client_socket = result catch |err| {
-                std.log.err("Server.acceptCallback - result:: {}", .{err});
-                return .disarm;
-            };
-
-            self.next_id += 1;
-            var client = Client(T).init(
-                self.next_id,
-                self.allocator,
-                self.buffer_pool,
-                self.completion_pool,
-                self.service,
-            ) catch |err| {
-                std.log.err("Server.acceptCallback - Client.init:: {}", .{err});
-                return .disarm;
-            };
-
-            client.receive(ev_loop, client_socket);
-            self.accept(ev_loop);
-
-            return .disarm;
-        }
-    };
-}
-
 pub fn run(
     comptime T: type,
     allocator: mem.Allocator,
     address: std.net.Address,
     service: T,
+    comptime thread_size: u4,
 ) !void {
     const tcp_socket = try xev.TCP.init(address);
     try tcp_socket.bind(address);
     try tcp_socket.listen(std.os.linux.SOMAXCONN);
 
-    var ev_loop = try xev.Loop.init(.{});
-    var buffer_pool = try BufferPool.initPreheated(allocator, 32);
-    var completion_pool = CompletionPool.init(allocator);
+    var workers: [thread_size]*Worker(T) = undefined;
+    for (&workers, 0..) |*a, i| {
+        a.* = try Worker(T).init(allocator, service);
+        a.*.start() catch |err| {
+            std.log.err("minihttp.run - can't start worker[{}] :: {}", .{ i, err });
+        };
+    }
+    defer for (workers) |a| a.deinit();
 
-    var server = try Server(T).init(allocator, &buffer_pool, &completion_pool, tcp_socket, service);
+    var server = try Server(T).init(allocator, tcp_socket, &workers);
+    defer server.deinit();
 
-    server.accept(&ev_loop);
+    try server.start();
     std.log.info("Server started at port {d}", .{address.getPort()});
 
-    try ev_loop.run(.until_done);
+    server.join();
+    for (workers) |t| t.join();
 }

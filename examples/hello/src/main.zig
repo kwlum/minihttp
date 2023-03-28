@@ -16,5 +16,5 @@ pub fn main() !void {
 
     const address = try std.net.Address.parseIp4("127.0.0.1", 8080);
     var service = HelloWorldService{};
-    try minihttp.run(*HelloWorldService, gpa.allocator(), address, &service);
+    try minihttp.run(*HelloWorldService, gpa.allocator(), address, &service, 2);
 }
