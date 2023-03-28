@@ -243,6 +243,10 @@ fn Server(comptime T: type) type {
     };
 }
 
+const Command = union(enum) {
+    new_client: xev.TCP,
+};
+
 fn Worker(comptime T: type) type {
     return struct {
         completion_pool: CompletionPool,
@@ -251,7 +255,7 @@ fn Worker(comptime T: type) type {
         ev_loop: xev.Loop,
         allocator: mem.Allocator,
         service: T,
-        new_client: ?xev.TCP = null, // TODO(KW): turn this to command queue.
+        commands: std.atomic.Queue(Command),
         thread: ?std.Thread = null,
 
         const Self = @This();
@@ -269,6 +273,7 @@ fn Worker(comptime T: type) type {
             worker.* = .{
                 .completion_pool = CompletionPool.init(allocator),
                 .buffer_pool = BufferPool.init(allocator),
+                .commands = std.atomic.Queue(Command).init(),
                 .allocator = allocator,
                 .service = service,
                 .ev_loop = ev_loop,
@@ -310,7 +315,13 @@ fn Worker(comptime T: type) type {
             socket: xev.TCP,
         ) !void {
             _ = id;
-            self.new_client = socket;
+            const node = try self.allocator.create(std.TailQueue(Command).Node);
+            node.* = .{
+                .prev = null,
+                .next = null,
+                .data = .{ .new_client = socket },
+            };
+            self.commands.put(node);
             try self.notifier.notify();
         }
 
@@ -335,9 +346,15 @@ fn Worker(comptime T: type) type {
 
             std.log.debug("Worker.onWake [{}]", .{std.Thread.getCurrentId()});
 
-            if (self.new_client) |socket| {
-                self.receive(ev_loop, socket);
-                self.new_client = null;
+            while (self.commands.get()) |node| {
+                defer self.allocator.destroy(node);
+                const command = node.data;
+
+                switch (command) {
+                    .new_client => |socket| {
+                        self.receive(ev_loop, socket);
+                    },
+                }
             }
 
             const c = self.completion_pool.create() catch unreachable;
