@@ -146,13 +146,17 @@ const BufferPool = std.heap.MemoryPool([4096]u8);
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
 
 const Accept = struct {
+    allocator: mem.Allocator,
     buffer_pool: BufferPool,
     completion_pool: CompletionPool,
     ev_loop: xev.Loop,
     socket: xev.TCP,
     next_id: usize = 0,
     workers: []Worker,
+    commands: std.atomic.Queue(Command),
+    notifier: xev.Async,
     thread: ?std.Thread = null,
+    stop: bool = false,
 
     const Self = @This();
 
@@ -162,18 +166,27 @@ const Accept = struct {
         workers: []Worker,
     ) !Accept {
         var ev_loop = try xev.Loop.init(.{});
+        errdefer ev_loop.deinit();
+
+        var notifier = try xev.Async.init();
+        errdefer notifier.deinit();
 
         return .{
+            .allocator = allocator,
             .buffer_pool = BufferPool.init(allocator),
             .completion_pool = CompletionPool.init(allocator),
             .socket = socket,
             .ev_loop = ev_loop,
             .workers = workers,
+            .commands = std.atomic.Queue(Command).init(),
+            .notifier = notifier,
             .next_id = 0,
         };
     }
 
     fn deinit(self: *Self) void {
+        std.log.debug("Accept.deinit [{}]", .{std.Thread.getCurrentId()});
+        self.notifier.deinit();
         self.ev_loop.deinit();
         self.completion_pool.deinit();
         self.buffer_pool.deinit();
@@ -189,13 +202,60 @@ const Accept = struct {
     }
 
     fn run(self: *Self) void {
+        const completion = self.completion_pool.create() catch unreachable;
+        self.notifier.wait(&self.ev_loop, completion, Self, self, onWake);
         self.accept();
         self.ev_loop.run(.until_done) catch |err| {
             std.log.err("Accept.run - loop run :: {}", .{err});
         };
     }
 
+    fn shutdown(self: *Self) !void {
+        const node = try self.allocator.create(std.TailQueue(Command).Node);
+        node.* = .{
+            .prev = null,
+            .next = null,
+            .data = .{ .stop = {} },
+        };
+        self.commands.put(node);
+        try self.notifier.notify();
+    }
+
+    fn onWake(
+        self_: ?*Self,
+        ev_loop: *xev.Loop,
+        completion: *xev.Completion,
+        r: xev.Async.WaitError!void,
+    ) xev.CallbackAction {
+        _ = r catch unreachable;
+        const self = self_.?;
+        defer self.completion_pool.destroy(completion);
+
+        std.log.debug("Accept.onWake [{}]", .{std.Thread.getCurrentId()});
+
+        while (self.commands.get()) |node| {
+            defer self.allocator.destroy(node);
+            const command = node.data;
+
+            switch (command) {
+                .new_client => {},
+                .stop => {
+                    self.stop = true;
+                    self.ev_loop.stop();
+                    return .disarm;
+                },
+            }
+        }
+
+        const c = self.completion_pool.create() catch unreachable;
+        self.notifier.wait(ev_loop, c, Self, self, onWake);
+
+        return .disarm;
+    }
+
     fn accept(self: *Self) void {
+        if (self.stop) return;
+
         std.log.debug("Accept.accept [{}]", .{std.Thread.getCurrentId()});
 
         const completion = self.completion_pool.create() catch unreachable;
@@ -324,6 +384,7 @@ const RequestHandler = struct {
 
 const Command = union(enum) {
     new_client: xev.TCP,
+    stop: void,
 };
 
 const Worker = struct {
@@ -335,6 +396,7 @@ const Worker = struct {
     request_handler: RequestHandler,
     commands: std.atomic.Queue(Command),
     thread: ?std.Thread = null,
+    stop: bool = false,
 
     const Self = @This();
 
@@ -357,6 +419,8 @@ const Worker = struct {
     }
 
     fn deinit(self: *Self) void {
+        std.log.debug("Worker.deinit [{}]", .{std.Thread.getCurrentId()});
+
         self.notifier.deinit();
         self.ev_loop.deinit();
         self.request_handler.deinit(self.allocator);
@@ -387,6 +451,8 @@ const Worker = struct {
         id: usize,
         socket: xev.TCP,
     ) !void {
+        if (self.stop) return;
+
         _ = id;
         const node = try self.allocator.create(std.TailQueue(Command).Node);
         node.* = .{
@@ -427,6 +493,11 @@ const Worker = struct {
                 .new_client => |socket| {
                     self.receive(ev_loop, socket);
                 },
+                .stop => {
+                    self.stop = true;
+                    self.ev_loop.stop();
+                    return .disarm;
+                },
             }
         }
 
@@ -437,6 +508,8 @@ const Worker = struct {
     }
 
     fn receive(self: *Self, ev_loop: *xev.Loop, socket: xev.TCP) void {
+        if (self.stop) return;
+
         std.log.debug("Worker.receive [{}]", .{std.Thread.getCurrentId()});
 
         const completion = self.completion_pool.create() catch unreachable;
@@ -463,10 +536,7 @@ const Worker = struct {
         const self = self_.?;
         std.log.debug("Worker.onReceive [{}]", .{std.Thread.getCurrentId()});
         defer {
-            if (completion.state() == .dead) {
-                self.completion_pool.destroy(completion);
-            }
-
+            self.completion_pool.destroy(completion);
             self.destroyBuffer(read_buffer.slice);
         }
 
@@ -536,6 +606,7 @@ const Worker = struct {
         buffer: []const u8,
         write_count: usize,
     ) void {
+        if (self.stop) return;
         std.log.debug("Worker.send [{}]", .{std.Thread.getCurrentId()});
 
         const completion = self.completion_pool.create() catch unreachable;
@@ -574,6 +645,8 @@ const Worker = struct {
     }
 
     fn close(self: *Self, ev_loop: *xev.Loop, socket: xev.TCP) void {
+        if (self.stop) return;
+
         std.log.debug("Worker.close", .{});
 
         const completion = self.completion_pool.create() catch unreachable;
@@ -605,11 +678,23 @@ pub const Config = struct {
     worker_size: u8 = 0,
 };
 
+var server_instance: ?*Server = null;
+
+fn on_signal(_: c_int) callconv(.C) void {
+    if (server_instance) |a| {
+        a.shutdown() catch |err| {
+            std.log.err("shutdown encounter error '{}'", .{err});
+        };
+    }
+}
+
 pub const Server = struct {
     allocator: mem.Allocator,
     config: Config,
     state: ?*anyopaque = null,
     make_handle_fn: *const fn (?*anyopaque, mem.Allocator) anyerror!RequestHandler,
+    workers: []Worker = undefined,
+    accept: *Accept = undefined,
 
     const Self = @This();
 
@@ -632,6 +717,18 @@ pub const Server = struct {
     }
 
     pub fn listen(self: *Self, address: std.net.Address) !void {
+        // register interrupt.
+        server_instance = self;
+        try std.os.sigaction(
+            std.os.SIG.INT,
+            &.{
+                .handler = .{ .handler = on_signal },
+                .mask = std.os.empty_sigset,
+                .flags = 0,
+            },
+            null,
+        );
+
         const tcp_socket = try xev.TCP.init(address);
         try tcp_socket.bind(address);
         try tcp_socket.listen(std.os.linux.SOMAXCONN);
@@ -642,6 +739,7 @@ pub const Server = struct {
             self.config.worker_size;
 
         var workers = try self.allocator.alloc(Worker, worker_size);
+        self.workers = workers;
         defer {
             for (workers) |*a| a.deinit();
             self.allocator.free(workers);
@@ -664,11 +762,28 @@ pub const Server = struct {
 
         var accept = try Accept.init(self.allocator, tcp_socket, workers);
         defer accept.deinit();
+        self.accept = &accept;
 
         try accept.start();
         std.log.info("Server started at port {d}", .{address.getPort()});
 
         accept.join();
         for (workers) |*t| t.join();
+    }
+
+    fn shutdown(self: *Server) !void {
+        std.log.info("Server shutting down.", .{});
+        for (self.workers) |*a| {
+            const node = try a.allocator.create(std.TailQueue(Command).Node);
+            node.* = .{
+                .prev = null,
+                .next = null,
+                .data = .{ .stop = {} },
+            };
+            a.commands.put(node);
+            try a.notifier.notify();
+        }
+
+        try self.accept.shutdown();
     }
 };
