@@ -6,7 +6,7 @@ const AppState = struct {
     message: []const u8,
 };
 
-const HelloWorldService = struct {
+pub const HelloWorldService = struct {
     state: *AppState = undefined,
     request: *minihttp.Request = undefined,
     response: *minihttp.Response = undefined,

@@ -250,12 +250,10 @@ const RequestHandler = struct {
     const Self = @This();
 
     fn init(
-        comptime State: type,
-        state: ?*State,
+        state: ?*anyopaque,
         comptime Service: type,
         allocator: mem.Allocator,
     ) !RequestHandler {
-        const alignment = @typeInfo(*State).Pointer.alignment;
         const service_alignment = @typeInfo(*Service).Pointer.alignment;
 
         const S = struct {
@@ -265,11 +263,16 @@ const RequestHandler = struct {
                 request: *Request,
                 response: *Response,
             ) !void {
-                const st = @ptrCast(*State, @alignCast(alignment, state_));
                 const service = @ptrCast(*Service, @alignCast(service_alignment, service_));
 
                 if (@hasField(Service, "state")) {
-                    @field(service, "state") = st;
+                    const State = @TypeOf(@field(service, "state"));
+                    const state_info = @typeInfo(State);
+
+                    if (state_) |a| {
+                        const st = @ptrCast(State, @alignCast(state_info.Pointer.alignment, a));
+                        @field(service, "state") = st;
+                    }
                 }
 
                 if (@hasField(Service, "request")) {
@@ -333,7 +336,7 @@ const Worker = struct {
 
     const Self = @This();
 
-    fn init(comptime T: type, comptime State: type, state: ?*State, allocator: mem.Allocator) !*Self {
+    fn init(comptime T: type, state: ?*anyopaque, allocator: mem.Allocator) !*Self {
         var worker = try allocator.create(Self);
         errdefer allocator.destroy(worker);
 
@@ -343,7 +346,7 @@ const Worker = struct {
         var notifier = try xev.Async.init();
         errdefer notifier.deinit();
 
-        var request_handler = try RequestHandler.init(State, state, T, allocator);
+        var request_handler = try RequestHandler.init(state, T, allocator);
 
         worker.* = .{
             .completion_pool = CompletionPool.init(allocator),
@@ -618,7 +621,7 @@ pub fn run(
 
     var workers: [thread_size]*Worker = undefined;
     for (&workers, 0..) |*a, i| {
-        const worker = try Worker.init(Service, State, state, allocator);
+        const worker = try Worker.init(Service, state, allocator);
         a.* = worker;
         worker.start() catch |err| {
             std.log.err("minihttp.run - can't start worker[{}] :: {}", .{ i, err });
