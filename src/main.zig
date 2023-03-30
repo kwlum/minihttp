@@ -145,13 +145,13 @@ const HttpCodec = struct {
 const BufferPool = std.heap.MemoryPool([4096]u8);
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
 
-const Server = struct {
+const Accept = struct {
     buffer_pool: BufferPool,
     completion_pool: CompletionPool,
     ev_loop: xev.Loop,
     socket: xev.TCP,
     next_id: usize = 0,
-    workers: []*Worker,
+    workers: []Worker,
     thread: ?std.Thread = null,
 
     const Self = @This();
@@ -159,8 +159,8 @@ const Server = struct {
     fn init(
         allocator: mem.Allocator,
         socket: xev.TCP,
-        workers: []*Worker,
-    ) !Server {
+        workers: []Worker,
+    ) !Accept {
         var ev_loop = try xev.Loop.init(.{});
 
         return .{
@@ -181,7 +181,7 @@ const Server = struct {
 
     fn start(self: *Self) !void {
         self.thread = try std.Thread.spawn(.{}, Self.run, .{self});
-        try self.thread.?.setName("minihttp-server");
+        try self.thread.?.setName("minihttp-accept");
     }
 
     fn join(self: *Self) void {
@@ -191,11 +191,13 @@ const Server = struct {
     fn run(self: *Self) void {
         self.accept();
         self.ev_loop.run(.until_done) catch |err| {
-            std.log.err("Server.run - loop run :: {}", .{err});
+            std.log.err("Accept.run - loop run :: {}", .{err});
         };
     }
 
     fn accept(self: *Self) void {
+        std.log.debug("Accept.accept [{}]", .{std.Thread.getCurrentId()});
+
         const completion = self.completion_pool.create() catch unreachable;
         self.socket.accept(&self.ev_loop, completion, Self, self, onAccept);
     }
@@ -207,7 +209,7 @@ const Server = struct {
         result: xev.AcceptError!xev.TCP,
     ) xev.CallbackAction {
         const self = self_.?;
-        std.log.debug("Server.onAccept [{}]", .{std.Thread.getCurrentId()});
+        std.log.debug("Accept.onAccept [{}]", .{std.Thread.getCurrentId()});
 
         defer {
             if (completion.state() == .dead) {
@@ -216,7 +218,7 @@ const Server = struct {
         }
 
         const client_socket = result catch |err| {
-            std.log.err("Server.onAccept - result :: {}", .{err});
+            std.log.err("Accept.onAccept - result :: {}", .{err});
             return .disarm;
         };
 
@@ -228,7 +230,7 @@ const Server = struct {
                 self.next_id,
                 client_socket,
             ) catch |err| {
-                std.log.err("Server.onAccept - add client to worker :: {}", .{err});
+                std.log.err("Accept.onAccept - add client to worker :: {}", .{err});
                 continue;
             };
 
@@ -336,19 +338,14 @@ const Worker = struct {
 
     const Self = @This();
 
-    fn init(comptime T: type, state: ?*anyopaque, allocator: mem.Allocator) !*Self {
-        var worker = try allocator.create(Self);
-        errdefer allocator.destroy(worker);
-
+    fn init(allocator: mem.Allocator, request_handler: RequestHandler) !Self {
         var ev_loop = try xev.Loop.init(.{});
         errdefer ev_loop.deinit();
 
         var notifier = try xev.Async.init();
         errdefer notifier.deinit();
 
-        var request_handler = try RequestHandler.init(state, T, allocator);
-
-        worker.* = .{
+        return .{
             .completion_pool = CompletionPool.init(allocator),
             .buffer_pool = BufferPool.init(allocator),
             .commands = std.atomic.Queue(Command).init(),
@@ -357,8 +354,6 @@ const Worker = struct {
             .ev_loop = ev_loop,
             .notifier = notifier,
         };
-
-        return worker;
     }
 
     fn deinit(self: *Self) void {
@@ -367,7 +362,6 @@ const Worker = struct {
         self.request_handler.deinit(self.allocator);
         self.completion_pool.deinit();
         self.buffer_pool.deinit();
-        self.allocator.destroy(self);
     }
 
     fn start(self: *Self) !void {
@@ -607,34 +601,74 @@ const Worker = struct {
     }
 };
 
-pub fn run(
-    comptime State: type,
-    state: ?*State,
-    comptime Service: type,
-    allocator: mem.Allocator,
-    address: std.net.Address,
-    comptime thread_size: u8,
-) !void {
-    const tcp_socket = try xev.TCP.init(address);
-    try tcp_socket.bind(address);
-    try tcp_socket.listen(std.os.linux.SOMAXCONN);
+pub const Config = struct {
+    worker_size: u8 = 0,
+};
 
-    var workers: [thread_size]*Worker = undefined;
-    for (&workers, 0..) |*a, i| {
-        const worker = try Worker.init(Service, state, allocator);
-        a.* = worker;
-        worker.start() catch |err| {
-            std.log.err("minihttp.run - can't start worker[{}] :: {}", .{ i, err });
+pub const Server = struct {
+    allocator: mem.Allocator,
+    config: Config,
+    state: ?*anyopaque = null,
+    make_handle_fn: *const fn (?*anyopaque, mem.Allocator) anyerror!RequestHandler,
+
+    const Self = @This();
+
+    pub fn init(allocator: mem.Allocator, config: Config) Server {
+        return .{
+            .allocator = allocator,
+            .config = config,
+            .make_handle_fn = undefined,
         };
     }
-    defer for (workers) |a| a.deinit();
 
-    var server = try Server.init(allocator, tcp_socket, &workers);
-    defer server.deinit();
+    pub fn service(self: *Self, state: ?*anyopaque, comptime Service: type) void {
+        const S = struct {
+            fn makeHandler(st: ?*anyopaque, alloc: mem.Allocator) !RequestHandler {
+                return RequestHandler.init(st, Service, alloc);
+            }
+        };
+        self.state = state;
+        self.make_handle_fn = S.makeHandler;
+    }
 
-    try server.start();
-    std.log.info("Server started at port {d}", .{address.getPort()});
+    pub fn listen(self: *Self, address: std.net.Address) !void {
+        const tcp_socket = try xev.TCP.init(address);
+        try tcp_socket.bind(address);
+        try tcp_socket.listen(std.os.linux.SOMAXCONN);
 
-    server.join();
-    for (workers) |t| t.join();
-}
+        const worker_size = if (self.config.worker_size == 0)
+            try std.Thread.getCpuCount()
+        else
+            self.config.worker_size;
+
+        var workers = try self.allocator.alloc(Worker, worker_size);
+        defer {
+            for (workers) |*a| a.deinit();
+            self.allocator.free(workers);
+        }
+
+        for (workers, 0..) |*a, i| {
+            const request_handler = try @call(
+                .auto,
+                self.make_handle_fn,
+                .{
+                    self.state,
+                    self.allocator,
+                },
+            );
+            a.* = try Worker.init(self.allocator, request_handler);
+            a.start() catch |err| {
+                std.log.err("minihttp.run - can't start worker[{}] :: {}", .{ i, err });
+            };
+        }
+
+        var accept = try Accept.init(self.allocator, tcp_socket, workers);
+        defer accept.deinit();
+
+        try accept.start();
+        std.log.info("Server started at port {d}", .{address.getPort()});
+
+        accept.join();
+        for (workers) |*t| t.join();
+    }
+};
