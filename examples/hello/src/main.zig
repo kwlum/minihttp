@@ -6,7 +6,7 @@ const AppState = struct {
     message: []const u8,
 };
 
-const HelloWorldService = struct {
+pub const HelloWorldService = struct {
     state: *AppState = undefined,
     request: *minihttp.Request = undefined,
     response: *minihttp.Response = undefined,
@@ -26,5 +26,8 @@ pub fn main() !void {
     var state = AppState{
         .message = "Hello, World!",
     };
-    try minihttp.run(AppState, &state, HelloWorldService, gpa.allocator(), address, 2);
+
+    var server = minihttp.Server.init(gpa.allocator(), .{});
+    server.service(&state, HelloWorldService);
+    try server.listen(address);
 }
