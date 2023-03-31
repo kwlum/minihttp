@@ -210,17 +210,6 @@ const Accept = struct {
         self.accept(localLoop());
     }
 
-    fn shutdown(self: *Self) !void {
-        const node = try self.allocator.create(std.TailQueue(Command).Node);
-        node.* = .{
-            .prev = null,
-            .next = null,
-            .data = .{ .stop = {} },
-        };
-        self.commands.put(node);
-        try self.notifier.notify();
-    }
-
     fn onWake(
         self_: ?*Self,
         ev_loop: *xev.Loop,
