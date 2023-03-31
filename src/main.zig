@@ -145,17 +145,33 @@ const HttpCodec = struct {
 const BufferPool = std.heap.MemoryPool([4096]u8);
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
 
+const Command = union(enum) {
+    new_client: xev.TCP,
+    stop: void,
+};
+
+const CommandQueue = struct {
+    commands: std.atomic.Queue(Command),
+    notifier: xev.Async,
+
+    const Self = @This();
+
+    fn push(self: *Self, allocator: mem.Allocator, command: Command) !void {
+        var node = try allocator.create(std.TailQueue(Command).Node);
+        node.* = .{ .data = command };
+        self.commands.put(node);
+        try self.notifier.notify();
+    }
+};
+
 const Accept = struct {
     allocator: mem.Allocator,
     buffer_pool: BufferPool,
     completion_pool: CompletionPool,
-    ev_loop: xev.Loop,
     socket: xev.TCP,
     next_id: usize = 0,
-    workers: []Worker,
-    commands: std.atomic.Queue(Command),
-    notifier: xev.Async,
-    thread: ?std.Thread = null,
+    workers: []*CommandQueue,
+    commands: CommandQueue,
     stop: bool = false,
 
     const Self = @This();
@@ -163,51 +179,35 @@ const Accept = struct {
     fn init(
         allocator: mem.Allocator,
         socket: xev.TCP,
-        workers: []Worker,
+        workers: []*CommandQueue,
     ) !Accept {
-        var ev_loop = try xev.Loop.init(.{});
-        errdefer ev_loop.deinit();
-
-        var notifier = try xev.Async.init();
-        errdefer notifier.deinit();
+        var commands: CommandQueue = .{
+            .notifier = try xev.Async.init(),
+            .commands = std.atomic.Queue(Command).init(),
+        };
 
         return .{
             .allocator = allocator,
             .buffer_pool = BufferPool.init(allocator),
             .completion_pool = CompletionPool.init(allocator),
             .socket = socket,
-            .ev_loop = ev_loop,
             .workers = workers,
-            .commands = std.atomic.Queue(Command).init(),
-            .notifier = notifier,
+            .commands = commands,
             .next_id = 0,
         };
     }
 
     fn deinit(self: *Self) void {
         std.log.debug("Accept.deinit [{}]", .{std.Thread.getCurrentId()});
-        self.notifier.deinit();
-        self.ev_loop.deinit();
+        self.commands.notifier.deinit();
         self.completion_pool.deinit();
         self.buffer_pool.deinit();
     }
 
     fn start(self: *Self) !void {
-        self.thread = try std.Thread.spawn(.{}, Self.run, .{self});
-        try self.thread.?.setName("minihttp-accept");
-    }
-
-    fn join(self: *Self) void {
-        if (self.thread) |t| t.join();
-    }
-
-    fn run(self: *Self) void {
-        const completion = self.completion_pool.create() catch unreachable;
-        self.notifier.wait(&self.ev_loop, completion, Self, self, onWake);
-        self.accept();
-        self.ev_loop.run(.until_done) catch |err| {
-            std.log.err("Accept.run - loop run :: {}", .{err});
-        };
+        const completion = try self.completion_pool.create();
+        self.commands.notifier.wait(localLoop(), completion, Self, self, onWake);
+        self.accept(localLoop());
     }
 
     fn shutdown(self: *Self) !void {
@@ -233,7 +233,7 @@ const Accept = struct {
 
         std.log.debug("Accept.onWake [{}]", .{std.Thread.getCurrentId()});
 
-        while (self.commands.get()) |node| {
+        while (self.commands.commands.get()) |node| {
             defer self.allocator.destroy(node);
             const command = node.data;
 
@@ -241,30 +241,30 @@ const Accept = struct {
                 .new_client => {},
                 .stop => {
                     self.stop = true;
-                    self.ev_loop.stop();
+                    ev_loop.stop();
                     return .disarm;
                 },
             }
         }
 
         const c = self.completion_pool.create() catch unreachable;
-        self.notifier.wait(ev_loop, c, Self, self, onWake);
+        self.commands.notifier.wait(ev_loop, c, Self, self, onWake);
 
         return .disarm;
     }
 
-    fn accept(self: *Self) void {
+    fn accept(self: *Self, ev_loop: *xev.Loop) void {
         if (self.stop) return;
 
         std.log.debug("Accept.accept [{}]", .{std.Thread.getCurrentId()});
 
         const completion = self.completion_pool.create() catch unreachable;
-        self.socket.accept(&self.ev_loop, completion, Self, self, onAccept);
+        self.socket.accept(ev_loop, completion, Self, self, onAccept);
     }
 
     fn onAccept(
         self_: ?*Self,
-        _: *xev.Loop,
+        ev_loop: *xev.Loop,
         completion: *xev.Completion,
         result: xev.AcceptError!xev.TCP,
     ) xev.CallbackAction {
@@ -286,10 +286,7 @@ const Accept = struct {
         var i: usize = 0;
         while (i < self.workers.len) : (i += 1) {
             const index = (self.next_id + i) % self.workers.len;
-            self.workers[index].add(
-                self.next_id,
-                client_socket,
-            ) catch |err| {
+            self.workers[index].push(self.allocator, .{ .new_client = client_socket }) catch |err| {
                 std.log.err("Accept.onAccept - add client to worker :: {}", .{err});
                 continue;
             };
@@ -297,11 +294,13 @@ const Accept = struct {
             break;
         }
 
-        self.accept();
+        self.accept(ev_loop);
 
         return .disarm;
     }
 };
+
+// Client request worker.
 
 const RequestHandler = struct {
     service: *anyopaque,
@@ -382,59 +381,43 @@ const RequestHandler = struct {
     }
 };
 
-const Command = union(enum) {
-    new_client: xev.TCP,
-    stop: void,
-};
-
 const Worker = struct {
     completion_pool: CompletionPool,
     buffer_pool: BufferPool,
-    notifier: xev.Async,
-    ev_loop: xev.Loop,
     allocator: mem.Allocator,
     request_handler: RequestHandler,
-    commands: std.atomic.Queue(Command),
-    thread: ?std.Thread = null,
+    commands: CommandQueue,
     stop: bool = false,
 
     const Self = @This();
 
     fn init(allocator: mem.Allocator, request_handler: RequestHandler) !Self {
-        var ev_loop = try xev.Loop.init(.{});
-        errdefer ev_loop.deinit();
-
-        var notifier = try xev.Async.init();
-        errdefer notifier.deinit();
+        var commands: CommandQueue = .{
+            .notifier = try xev.Async.init(),
+            .commands = std.atomic.Queue(Command).init(),
+        };
 
         return .{
             .completion_pool = CompletionPool.init(allocator),
             .buffer_pool = BufferPool.init(allocator),
-            .commands = std.atomic.Queue(Command).init(),
+            .commands = commands,
             .allocator = allocator,
             .request_handler = request_handler,
-            .ev_loop = ev_loop,
-            .notifier = notifier,
         };
     }
 
     fn deinit(self: *Self) void {
         std.log.debug("Worker.deinit [{}]", .{std.Thread.getCurrentId()});
 
-        self.notifier.deinit();
-        self.ev_loop.deinit();
+        self.commands.notifier.deinit();
         self.request_handler.deinit(self.allocator);
         self.completion_pool.deinit();
         self.buffer_pool.deinit();
     }
 
     fn start(self: *Self) !void {
-        self.thread = try std.Thread.spawn(.{}, Self.run, .{self});
-        try self.thread.?.setName("minihttp-worker");
-    }
-
-    fn join(self: *Self) void {
-        if (self.thread) |t| t.join();
+        const completion = try self.completion_pool.create();
+        self.commands.notifier.wait(localLoop(), completion, Self, self, onWake);
     }
 
     fn destroyBuffer(self: *Self, buffer: []const u8) void {
@@ -444,33 +427,6 @@ const Worker = struct {
                 @intToPtr(*[4096]u8, @ptrToInt(buffer.ptr)),
             ),
         );
-    }
-
-    fn add(
-        self: *Self,
-        id: usize,
-        socket: xev.TCP,
-    ) !void {
-        if (self.stop) return;
-
-        _ = id;
-        const node = try self.allocator.create(std.TailQueue(Command).Node);
-        node.* = .{
-            .prev = null,
-            .next = null,
-            .data = .{ .new_client = socket },
-        };
-        self.commands.put(node);
-        try self.notifier.notify();
-    }
-
-    fn run(self: *Self) void {
-        const completion = self.completion_pool.create() catch unreachable;
-        self.notifier.wait(&self.ev_loop, completion, Self, self, onWake);
-        self.ev_loop.run(.until_done) catch |err| {
-            std.log.err("Worker.run - ev_loop.run :: {}", .{err});
-            return;
-        };
     }
 
     fn onWake(
@@ -485,7 +441,7 @@ const Worker = struct {
 
         std.log.debug("Worker.onWake [{}]", .{std.Thread.getCurrentId()});
 
-        while (self.commands.get()) |node| {
+        while (self.commands.commands.get()) |node| {
             defer self.allocator.destroy(node);
             const command = node.data;
 
@@ -495,14 +451,14 @@ const Worker = struct {
                 },
                 .stop => {
                     self.stop = true;
-                    self.ev_loop.stop();
+                    ev_loop.stop();
                     return .disarm;
                 },
             }
         }
 
         const c = self.completion_pool.create() catch unreachable;
-        self.notifier.wait(ev_loop, c, Self, self, onWake);
+        self.commands.notifier.wait(ev_loop, c, Self, self, onWake);
 
         return .disarm;
     }
@@ -674,6 +630,52 @@ const Worker = struct {
     }
 };
 
+// Thread local ev loop.
+
+threadlocal var local_ev_loop: xev.Loop = undefined;
+
+fn localLoop() *xev.Loop {
+    return &local_ev_loop;
+}
+
+fn LoopThread(comptime T: type) type {
+    return struct {
+        thread: std.Thread = undefined,
+        handler: *T = undefined,
+
+        const Self = @This();
+
+        fn start(self: *Self, handler: *T) !void {
+            self.handler = handler;
+            self.thread = try std.Thread.spawn(.{}, Self.run, .{self});
+            try self.thread.setName("mh-loopthread");
+        }
+
+        fn join(self: *Self) void {
+            self.thread.join();
+        }
+
+        fn run(self: *Self) void {
+            local_ev_loop = xev.Loop.init(.{}) catch |err| {
+                std.log.err("LoopThread.run - error starting loop :: '{}'", .{err});
+                return;
+            };
+            defer local_ev_loop.deinit();
+
+            self.handler.start() catch |err| {
+                std.log.err("LoopThread.run - error starting handler :: '{}'", .{err});
+                return;
+            };
+
+            local_ev_loop.run(.until_done) catch |err| {
+                std.log.err("LoopThread.run - loop run :: '{}'", .{err});
+            };
+        }
+    };
+}
+
+// Singleton server and configuration.
+
 pub const Config = struct {
     worker_size: u8 = 0,
 };
@@ -693,6 +695,7 @@ pub const Server = struct {
     config: Config,
     state: ?*anyopaque = null,
     make_handle_fn: *const fn (?*anyopaque, mem.Allocator) anyerror!RequestHandler,
+    // TODO: (KW) make this as shutdown listener.
     workers: []Worker = undefined,
     accept: *Accept = undefined,
 
@@ -745,7 +748,13 @@ pub const Server = struct {
             self.allocator.free(workers);
         }
 
-        for (workers, 0..) |*a, i| {
+        var worker_threads = try self.allocator.alloc(LoopThread(Worker), worker_size);
+        defer self.allocator.free(worker_threads);
+
+        var command_queues = try self.allocator.alloc(*CommandQueue, worker_size);
+        defer self.allocator.free(command_queues);
+
+        for (workers, worker_threads, 0..) |*a, *t, i| {
             const request_handler = try @call(
                 .auto,
                 self.make_handle_fn,
@@ -755,35 +764,32 @@ pub const Server = struct {
                 },
             );
             a.* = try Worker.init(self.allocator, request_handler);
-            a.start() catch |err| {
-                std.log.err("minihttp.run - can't start worker[{}] :: {}", .{ i, err });
-            };
+            command_queues[i] = &a.commands;
+            try t.start(a);
         }
 
-        var accept = try Accept.init(self.allocator, tcp_socket, workers);
+        var accept = try Accept.init(self.allocator, tcp_socket, command_queues);
         defer accept.deinit();
         self.accept = &accept;
+        var accept_thread: LoopThread(Accept) = .{};
+        try accept_thread.start(&accept);
 
-        try accept.start();
         std.log.info("Server started at port {d}", .{address.getPort()});
 
-        accept.join();
-        for (workers) |*t| t.join();
+        accept_thread.join();
+        for (worker_threads) |*t| t.join();
     }
 
     fn shutdown(self: *Server) !void {
         std.log.info("Server shutting down.", .{});
         for (self.workers) |*a| {
-            const node = try a.allocator.create(std.TailQueue(Command).Node);
-            node.* = .{
-                .prev = null,
-                .next = null,
-                .data = .{ .stop = {} },
+            a.commands.push(self.allocator, .{ .stop = {} }) catch |err| {
+                std.log.err("Shutdown - can't send stop command to <Worker> :: '{}'", .{err});
             };
-            a.commands.put(node);
-            try a.notifier.notify();
         }
 
-        try self.accept.shutdown();
+        self.accept.commands.push(self.allocator, .{ .stop = {} }) catch |err| {
+            std.log.err("Shutdown - can't send stop command to <Accept> :: '{}'", .{err});
+        };
     }
 };
